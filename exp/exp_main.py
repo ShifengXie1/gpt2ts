@@ -11,13 +11,6 @@ from models import gpt2ts
 from utils.metrics import metric
 
 
-def build_setting(args):
-    return (
-        f"{args.task_name}_{args.data}_{args.model}_"
-        f"sl{args.seq_len}_pl{args.pred_len}_ps{args.patch_len}"
-    )
-
-
 class TokenLLM_Main:
     def __init__(self, args):
         self.args = args
