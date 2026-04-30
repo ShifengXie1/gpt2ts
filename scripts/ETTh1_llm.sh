@@ -1,6 +1,7 @@
 #!/bin/bash
 
 export CUDA_VISIBLE_DEVICES=0
+export OMP_NUM_THREADS=20
 
 DATA_NAME="ETTh1"
 RESULTS_DIR="./results"
