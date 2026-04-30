@@ -5,232 +5,267 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-
-from Tokenizer.models.GPT2ClusterVQ import VQVAE as GPT2ClusterTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM
 
 
-class TimeSeriesVocabMapper(nn.Module):
-    def __init__(self, mode="soft_vocab", tau=0.2, top_k=0, normalize=True):
+def _get_bool(configs, name, default=False):
+    return bool(getattr(configs, name, default))
+
+
+class LoRAConv1D(nn.Module):
+    """LoRA adapter for GPT-2's Conv1D projections."""
+
+    def __init__(self, base_layer, r=8, alpha=16, dropout=0.0):
         super().__init__()
-        self.mode = str(mode)
-        self.tau = max(float(tau), 1e-6)
-        self.top_k = max(0, int(top_k))
-        self.normalize = bool(normalize)
-
-    def forward(self, ts_embeds, vocab_weight):
-        queries = ts_embeds
-        keys = vocab_weight
-        if self.normalize:
-            queries = F.normalize(queries, dim=-1)
-            keys = F.normalize(keys, dim=-1)
-
-        logits = queries @ keys.transpose(0, 1)
-        if self.top_k > 0 and self.top_k < logits.shape[-1]:
-            top_values, top_indices = torch.topk(logits, k=self.top_k, dim=-1)
-            masked_logits = torch.full_like(logits, float("-inf"))
-            logits = masked_logits.scatter(-1, top_indices, top_values)
-
-        probs = F.softmax(logits / self.tau, dim=-1)
-        soft_embeds = probs @ vocab_weight
-
-        if self.mode in {"st_vocab", "hard_vocab"}:
-            hard_ids = probs.argmax(dim=-1)
-            hard_embeds = F.embedding(hard_ids, vocab_weight)
-            mapped = hard_embeds.detach() - soft_embeds.detach() + soft_embeds
-        elif self.mode == "none":
-            mapped = ts_embeds
-        else:
-            mapped = soft_embeds
-
-        entropy = -(probs * torch.log(probs.clamp_min(1e-8))).sum(dim=-1).mean()
-        return mapped, entropy
-
-
-class FrozenTokenizerAdapter(nn.Module):
-    """Wraps the trained TokenCast tokenizer while keeping its parameters frozen."""
-
-    def __init__(self, configs):
-        super().__init__()
-        self.configs = configs
-        self.cfg = self._build_tokenizer_config(configs)
-        self.vq_model = getattr(configs, "vq_model", "GPT2ClusterVQ")
-        if self.vq_model != "GPT2ClusterVQ":
-            raise ValueError(f"Unsupported tokenizer model: {self.vq_model}. Use `GPT2ClusterVQ`.")
-        self.model = GPT2ClusterTokenizer(self.cfg)
-        self._load_checkpoint(configs)
-        self.model.eval()
-        for param in self.model.parameters():
+        self.base_layer = base_layer
+        for param in self.base_layer.parameters():
             param.requires_grad = False
 
-        self.hidden_dim = int(self.cfg.d_model)
-        self.patch_len = int(self.cfg.wave_length)
+        self.r = int(r)
+        self.scaling = float(alpha) / max(self.r, 1)
+        self.dropout = nn.Dropout(float(dropout))
 
-    def _build_tokenizer_config(self, configs):
-        return SimpleNamespace(
-            seq_len=int(configs.seq_len),
-            pred_len=int(configs.pred_len),
-            d_model=int(getattr(configs, "tokenizer_d_model", getattr(configs, "d_model", 64))),
-            n_embed=int(getattr(configs, "n_embed", getattr(configs, "num_ts_clusters", 256))),
-            block_num=int(getattr(configs, "tokenizer_block_num", getattr(configs, "block_num", 2))),
-            wave_length=int(getattr(configs, "wave_length", getattr(configs, "patch_len", 8))),
-            revin=int(getattr(configs, "revin", 1)),
-            affine=int(getattr(configs, "affine", 0)),
-            subtract_last=int(getattr(configs, "subtract_last", 0)),
-            chan_indep=int(getattr(configs, "chan_indep", 0)),
-            enc_in=int(getattr(configs, "enc_in", getattr(configs, "c_in", 1))),
-            entropy_penalty=float(getattr(configs, "entropy_penalty", 0.0)),
-            entropy_temp=float(getattr(configs, "entropy_temp", 0.5)),
-            gpt_local_path=getattr(configs, "gpt_local_path", None),
-            gpt_model_name=getattr(configs, "gpt_model_name", "openai-community/gpt2"),
-            gpt_local_files_only=getattr(configs, "gpt_local_files_only", True),
-            gpt2_hidden_size=int(getattr(configs, "gpt2_hidden_size", 768)),
-            init_gpt2_codebook=False,
-            cluster_tau=float(getattr(configs, "cluster_tau", 0.2)),
-            cluster_cosine=bool(getattr(configs, "cluster_cosine", True)),
-            commitment_weight=float(getattr(configs, "commitment_weight", 0.25)),
+        in_features = int(base_layer.weight.shape[0])
+        out_features = int(base_layer.weight.shape[1])
+        self.lora_A = nn.Parameter(torch.empty(self.r, in_features))
+        self.lora_B = nn.Parameter(torch.zeros(out_features, self.r))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+
+    def forward(self, x):
+        base = self.base_layer(x)
+        if self.r <= 0:
+            return base
+        update = F.linear(self.dropout(x), self.lora_A)
+        update = F.linear(update, self.lora_B) * self.scaling
+        return base + update
+
+
+class KMeansBridge(nn.Module):
+    """Maps time-series patch embeddings into GPT vocabulary-cluster space."""
+
+    def __init__(self, num_clusters=64, residual_scale=1.0, normalize=True, seed=0):
+        super().__init__()
+        self.num_clusters = int(num_clusters)
+        self.residual_scale = float(residual_scale)
+        self.normalize = bool(normalize)
+        self.seed = int(seed)
+        self.register_buffer("ts_centers", torch.empty(0), persistent=True)
+        self.register_buffer("vocab_centers", torch.empty(0), persistent=True)
+        self.register_buffer("ts_to_vocab", torch.empty(0, dtype=torch.long), persistent=True)
+        self.is_fitted = False
+
+    def fit(self, ts_embeds, vocab_embeds, iters=8):
+        device = ts_embeds.device
+        k = min(self.num_clusters, ts_embeds.shape[0], vocab_embeds.shape[0])
+        if k <= 0:
+            raise ValueError("Cannot fit clusters from empty embeddings.")
+
+        self.num_clusters = int(k)
+        self.ts_centers = self._kmeans(ts_embeds.float(), k, int(iters), self.seed)
+        self.vocab_centers = self._kmeans(vocab_embeds.float(), k, int(iters), self.seed + 13)
+
+        generator = torch.Generator(device=device)
+        generator.manual_seed(self.seed + 29)
+        self.ts_to_vocab = torch.randperm(k, generator=generator, device=device)
+        self.is_fitted = True
+
+    @torch.no_grad()
+    def _kmeans(self, x, k, iters, seed):
+        if x.ndim != 2:
+            x = x.reshape(-1, x.shape[-1])
+        x = x.detach()
+        generator = torch.Generator(device=x.device)
+        generator.manual_seed(seed)
+        if x.shape[0] >= k:
+            indices = torch.randperm(x.shape[0], generator=generator, device=x.device)[:k]
+        else:
+            indices = torch.randint(0, x.shape[0], (k,), generator=generator, device=x.device)
+        centers = x[indices].clone()
+
+        for _ in range(max(int(iters), 1)):
+            distance_source = F.normalize(x, dim=-1) if self.normalize else x
+            distance_centers = F.normalize(centers, dim=-1) if self.normalize else centers
+            distances = torch.cdist(distance_source, distance_centers)
+            assign = distances.argmin(dim=-1)
+
+            new_centers = centers.clone()
+            for cluster_id in range(k):
+                mask = assign == cluster_id
+                if mask.any():
+                    new_centers[cluster_id] = x[mask].mean(dim=0)
+            centers = new_centers
+        return centers
+
+    def _nearest_ts_center(self, embeds):
+        source = F.normalize(embeds, dim=-1) if self.normalize else embeds
+        centers = F.normalize(self.ts_centers, dim=-1) if self.normalize else self.ts_centers
+        distances = torch.cdist(source.float(), centers.float())
+        return distances.argmin(dim=-1)
+
+    def _nearest_vocab_center(self, embeds):
+        source = F.normalize(embeds, dim=-1) if self.normalize else embeds
+        centers = F.normalize(self.vocab_centers, dim=-1) if self.normalize else self.vocab_centers
+        distances = torch.cdist(source.float(), centers.float())
+        return distances.argmin(dim=-1)
+
+    def map_ts_to_vocab_space(self, ts_embeds):
+        if not self.is_fitted or self.ts_centers.numel() == 0:
+            return ts_embeds
+        center_ids = self._nearest_ts_center(ts_embeds)
+        ts_center = self.ts_centers[center_ids]
+        vocab_center = self.vocab_centers[self.ts_to_vocab[center_ids]]
+        residual = ts_embeds - ts_center.to(dtype=ts_embeds.dtype)
+        mapped = vocab_center.to(dtype=ts_embeds.dtype) + residual * self.residual_scale
+        return mapped
+
+    def map_vocab_to_ts_center(self, vocab_embeds):
+        if not self.is_fitted or self.vocab_centers.numel() == 0:
+            return vocab_embeds
+        vocab_center_ids = self._nearest_vocab_center(vocab_embeds)
+        inverse = torch.empty_like(self.ts_to_vocab)
+        inverse[self.ts_to_vocab] = torch.arange(self.ts_to_vocab.numel(), device=self.ts_to_vocab.device)
+        ts_center_ids = inverse[vocab_center_ids]
+        return self.ts_centers[ts_center_ids].to(dtype=vocab_embeds.dtype)
+
+
+class PatchTokenizer(nn.Module):
+    def __init__(self, patch_len, stride, c_in, gpt_dim, dropout=0.05):
+        super().__init__()
+        self.patch_len = int(patch_len)
+        self.stride = int(stride)
+        self.c_in = int(c_in)
+        patch_dim = self.patch_len * self.c_in
+        self.encoder = nn.Sequential(
+            nn.LayerNorm(patch_dim),
+            nn.Linear(patch_dim, gpt_dim),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(gpt_dim, gpt_dim),
         )
 
-    def _resolve_checkpoint(self, configs):
-        path = getattr(configs, "tokenizer_path", None) or getattr(configs, "vqvae_model_path", None)
-        if not path:
-            return None
-        if os.path.isdir(path):
-            return os.path.join(path, "model.pkl")
-        return path
+    def patchify(self, x):
+        if x.shape[1] < self.patch_len:
+            pad_len = self.patch_len - x.shape[1]
+            x = F.pad(x, (0, 0, 0, pad_len))
+        patches = x.unfold(dimension=1, size=self.patch_len, step=self.stride)
+        patches = patches.permute(0, 1, 3, 2).contiguous()
+        return patches
 
-    def _load_checkpoint(self, configs):
-        checkpoint = self._resolve_checkpoint(configs)
-        if not checkpoint:
-            raise ValueError("Stage-2 GPT2TS requires `--tokenizer_path` or `--vqvae_model_path`.")
-        if not os.path.exists(checkpoint):
-            raise FileNotFoundError(f"Tokenizer checkpoint not found: {checkpoint}")
-        state_dict = torch.load(checkpoint, map_location="cpu")
-        self.model.load_state_dict(state_dict, strict=False)
-        print(f"Loaded frozen tokenizer from {checkpoint}")
+    def encode(self, patches):
+        flat = patches.reshape(patches.shape[0], patches.shape[1], -1)
+        return self.encoder(flat)
 
-    def _normalize_history(self, x):
-        if self.model.revin:
-            return self.model.revin_layer(x, "norm")
-        return x
 
-    def _normalize_future_with_history_stats(self, y):
-        if self.model.revin:
-            return self.model.revin_layer._normalize(y)
-        return y
+class HistoryPatchDecoder(nn.Module):
+    def __init__(self, patch_len, stride, pred_len, temperature=0.2, hard_lookup=False):
+        super().__init__()
+        self.patch_len = int(patch_len)
+        self.stride = int(stride)
+        self.pred_len = int(pred_len)
+        self.temperature = max(float(temperature), 1e-6)
+        self.hard_lookup = bool(hard_lookup)
 
-    def _encode_normalized(self, x_norm):
-        enc = self.model.enc(x_norm)
-        quant_input = self.model.quantize_input(enc.unsqueeze(1)).squeeze(-1).transpose(1, 2)
-        quant, _, ids = self.model.quantize(quant_input)
-        return quant.detach(), ids.detach()
+    def forward(self, pred_embeds, history_embeds, history_patches):
+        query = F.normalize(pred_embeds, dim=-1)
+        key = F.normalize(history_embeds, dim=-1)
+        logits = torch.matmul(query, key.transpose(1, 2)) / self.temperature
 
-    @torch.no_grad()
-    def encode_history(self, x):
-        if hasattr(self.model, "encode_history_gpt"):
-            return self.model.encode_history_gpt(x)
-        x_norm = self._normalize_history(x)
-        return self._encode_normalized(x_norm)
+        if self.hard_lookup and not self.training:
+            indices = logits.argmax(dim=-1)
+            batch_ids = torch.arange(history_patches.shape[0], device=history_patches.device)[:, None]
+            pred_patches = history_patches[batch_ids, indices]
+        else:
+            weights = F.softmax(logits, dim=-1)
+            pred_patches = torch.einsum("bfh,bhpc->bfpc", weights, history_patches)
 
-    @torch.no_grad()
-    def encode_future_target(self, x, y):
-        if hasattr(self.model, "encode_future_target_gpt"):
-            return self.model.encode_future_target_gpt(x, y)
-        x_norm = self._normalize_history(x)
-        y_norm = self._normalize_future_with_history_stats(y)
-        full_norm = torch.cat([x_norm, y_norm], dim=1)
-        full_quant, full_ids = self._encode_normalized(full_norm)
-        history_tokens = x.shape[1] // self.patch_len
-        return full_quant[:, history_tokens:, :], full_ids[:, history_tokens:]
+        return self._overlap_add(pred_patches)
 
-    def decode_future(self, x, history_quant, future_quant, pred_len):
-        if hasattr(self.model, "decode_future_gpt"):
-            return self.model.decode_future_gpt(x, history_quant, future_quant, pred_len)
-        # Reset RevIN statistics from the current history before denormalizing decoder output.
-        _ = self._normalize_history(x)
-        full_quant = torch.cat([history_quant.detach(), future_quant], dim=1)
-        decoded = self.model.dec(full_quant)
-        if self.model.revin:
-            decoded = self.model.revin_layer(decoded, "denorm")
-        return decoded[:, x.shape[1] : x.shape[1] + pred_len, :]
+    def _overlap_add(self, patches):
+        batch, patch_count, _, channels = patches.shape
+        output = patches.new_zeros(batch, self.pred_len, channels)
+        counts = patches.new_zeros(batch, self.pred_len, channels)
 
-    def codebook(self):
-        if hasattr(self.model, "get_codebook_weight"):
-            return self.model.get_codebook_weight()
-        return None
+        for patch_idx in range(patch_count):
+            start = patch_idx * self.stride
+            if start >= self.pred_len:
+                break
+            end = min(start + self.patch_len, self.pred_len)
+            width = end - start
+            output[:, start:end, :] += patches[:, patch_idx, :width, :]
+            counts[:, start:end, :] += 1
+
+        return output / counts.clamp_min(1.0)
 
 
 class Model(nn.Module):
-    """Stage-2 TokenCast-style forecaster: frozen tokenizer + fully frozen GPT-2."""
+    """Patch-cluster GPT2 forecaster with LoRA-tuned attention."""
 
     def __init__(self, configs):
         super().__init__()
         self.configs = configs
         self.seq_len = int(configs.seq_len)
         self.pred_len = int(configs.pred_len)
-        self.c_out = int(getattr(configs, "c_out", getattr(configs, "enc_in", getattr(configs, "c_in", 1))))
-
-        self.tokenizer_adapter = FrozenTokenizerAdapter(configs)
-        self.tokenizer_dim = self.tokenizer_adapter.hidden_dim
-        self.patch_len = self.tokenizer_adapter.patch_len
+        self.c_in = int(getattr(configs, "c_in", getattr(configs, "enc_in", 1)))
+        self.c_out = int(getattr(configs, "c_out", self.c_in))
+        self.patch_len = int(getattr(configs, "patch_len", getattr(configs, "patch_size", 16)))
+        self.stride = int(getattr(configs, "stride", self.patch_len))
 
         self.gpt2_path = self._resolve_gpt2_path()
-        self.local_files_only = bool(getattr(configs, "gpt_local_files_only", True))
-        gpt2_config = AutoConfig.from_pretrained(
-            self.gpt2_path,
-            local_files_only=self.local_files_only,
-        )
+        self.local_files_only = _get_bool(configs, "gpt_local_files_only", True)
+        gpt_config = AutoConfig.from_pretrained(self.gpt2_path, local_files_only=self.local_files_only)
         requested_layers = int(getattr(configs, "n_layers", 0))
         if requested_layers > 0:
-            gpt2_config.n_layer = min(requested_layers, gpt2_config.n_layer)
-            gpt2_config.num_hidden_layers = gpt2_config.n_layer
-        gpt2_config.output_hidden_states = True
-        self.gpt_dim = int(gpt2_config.hidden_size)
+            gpt_config.n_layer = min(requested_layers, int(gpt_config.n_layer))
+            gpt_config.num_hidden_layers = gpt_config.n_layer
+        gpt_config.output_hidden_states = True
+        self.gpt_dim = int(gpt_config.hidden_size)
 
-        self.text_tokenizer = AutoTokenizer.from_pretrained(
-            self.gpt2_path,
-            local_files_only=self.local_files_only,
+        self.gpt2 = self._load_gpt2(gpt_config)
+        self._freeze_gpt2()
+        self._inject_lora()
+
+        self.patch_tokenizer = PatchTokenizer(
+            patch_len=self.patch_len,
+            stride=self.stride,
+            c_in=self.c_in,
+            gpt_dim=self.gpt_dim,
+            dropout=getattr(configs, "embedding_dropout", getattr(configs, "dropout", 0.05)),
         )
-        if self.text_tokenizer.pad_token is None:
-            self.text_tokenizer.pad_token = self.text_tokenizer.eos_token
-
-        self.gpt2 = self._load_gpt2(gpt2_config)
-        self._freeze_gpt2_completely()
-
-        tokenizer_codebook = self.tokenizer_adapter.codebook()
-        self.uses_gpt2_cluster_codebook = tokenizer_codebook is not None
-        if self.uses_gpt2_cluster_codebook:
-            self.register_buffer("gpt2_cluster_codebook", tokenizer_codebook.detach().float())
-            self.ts_to_gpt = nn.Identity()
-            self.hidden_to_code = nn.Sequential(nn.LayerNorm(self.gpt_dim), nn.Linear(self.gpt_dim, self.gpt_dim))
-        else:
-            self.ts_to_gpt = nn.Sequential(
-                nn.LayerNorm(self.tokenizer_dim),
-                nn.Linear(self.tokenizer_dim, self.gpt_dim),
-            )
-            self.hidden_to_code = nn.Sequential(nn.LayerNorm(self.gpt_dim), nn.Linear(self.gpt_dim, self.tokenizer_dim))
-        self.mapper = TimeSeriesVocabMapper(
-            mode=getattr(configs, "ts_embedding_mode", "soft_vocab"),
-            tau=getattr(configs, "ts_mapping_tau", getattr(configs, "cluster_tau", 0.2)),
-            top_k=getattr(configs, "ts_mapping_top_k", 0),
-            normalize=getattr(configs, "ts_mapping_normalize", True),
+        self.bridge = KMeansBridge(
+            num_clusters=getattr(configs, "num_clusters", 64),
+            residual_scale=getattr(configs, "cluster_residual_scale", 1.0),
+            normalize=getattr(configs, "cluster_normalize", True),
+            seed=getattr(configs, "cluster_seed", getattr(configs, "seed", 0)),
         )
 
-        future_token_count = math.ceil(self.pred_len / self.patch_len)
-        self.future_queries = nn.Parameter(torch.empty(future_token_count, self.gpt_dim))
+        self.future_patch_count = self._patch_count_for_length(self.pred_len)
+        self.future_queries = nn.Parameter(torch.empty(self.future_patch_count, self.gpt_dim))
         nn.init.normal_(self.future_queries, mean=0.0, std=self.gpt_dim ** -0.5)
 
+        self.decoder = HistoryPatchDecoder(
+            patch_len=self.patch_len,
+            stride=self.stride,
+            pred_len=self.pred_len,
+            temperature=getattr(configs, "history_lookup_temperature", 0.2),
+            hard_lookup=getattr(configs, "hard_patch_lookup", False),
+        )
+        self.output_dropout = nn.Dropout(float(getattr(configs, "dropout", 0.05)))
+
+    def _patch_count_for_length(self, length):
+        if length <= self.patch_len:
+            return 1
+        return math.ceil((length - self.patch_len) / self.stride) + 1
+
     def _resolve_gpt2_path(self):
-        path = getattr(self.configs, "gpt_local_path", None)
-        if path:
-            return path
-        path = getattr(self.configs, "local_model_path", None)
-        if path:
-            return path
+        local_path = getattr(self.configs, "gpt_local_path", None)
+        if local_path:
+            return local_path
+        if os.path.isdir("./gpt"):
+            return "./gpt"
         return getattr(self.configs, "gpt_model_name", "openai-community/gpt2")
 
     def _load_gpt2(self, config):
-        if bool(getattr(self.configs, "use_pretrained_gpt2", True)):
+        if _get_bool(self.configs, "use_pretrained_gpt2", True):
             return AutoModelForCausalLM.from_pretrained(
                 self.gpt2_path,
                 config=config,
@@ -238,53 +273,107 @@ class Model(nn.Module):
             )
         return AutoModelForCausalLM.from_config(config)
 
-    def _freeze_gpt2_completely(self):
+    def _freeze_gpt2(self):
         for param in self.gpt2.parameters():
             param.requires_grad = False
-        self.gpt2.eval()
 
-    def _codebook_weight(self):
-        if self.uses_gpt2_cluster_codebook:
-            return self.gpt2_cluster_codebook.to(device=next(self.parameters()).device)
+    def _inject_lora(self):
+        r = int(getattr(self.configs, "lora_r", 8))
+        if r <= 0:
+            return
+        alpha = float(getattr(self.configs, "lora_alpha", 16))
+        dropout = float(getattr(self.configs, "lora_dropout", 0.05))
+        targets = str(getattr(self.configs, "lora_target", "c_attn,c_proj")).split(",")
+        targets = {target.strip() for target in targets if target.strip()}
+
+        for block in self.gpt2.transformer.h:
+            if "c_attn" in targets:
+                block.attn.c_attn = LoRAConv1D(block.attn.c_attn, r=r, alpha=alpha, dropout=dropout)
+            if "c_proj" in targets:
+                block.attn.c_proj = LoRAConv1D(block.attn.c_proj, r=r, alpha=alpha, dropout=dropout)
+
+    def _vocab_weight(self):
         return self.gpt2.get_input_embeddings().weight.detach()
 
-    def _map_to_codebook(self, projected):
-        return self.mapper(projected, self._codebook_weight())
+    @torch.no_grad()
+    def fit_token_clusters(self, data_loader, device=None):
+        device = device or next(self.parameters()).device
+        sample_limit = int(getattr(self.configs, "cluster_sample_size", 8192))
+        vocab_limit = int(getattr(self.configs, "vocab_cluster_sample_size", 20000))
+        kmeans_iters = int(getattr(self.configs, "kmeans_iters", 8))
+
+        was_training = self.training
+        self.eval()
+        samples = []
+        seen = 0
+        for batch in data_loader:
+            batch_x = batch[0].to(device=device, dtype=torch.float)
+            patches = self.patch_tokenizer.patchify(batch_x)
+            embeds = self.patch_tokenizer.encode(patches).reshape(-1, self.gpt_dim)
+            samples.append(embeds.detach())
+            seen += embeds.shape[0]
+            if seen >= sample_limit:
+                break
+
+        if not samples:
+            raise ValueError("No patches found for fitting time-series clusters.")
+
+        ts_embeds = torch.cat(samples, dim=0)
+        if ts_embeds.shape[0] > sample_limit:
+            ts_embeds = ts_embeds[:sample_limit]
+
+        vocab_embeds = self._vocab_weight().to(device=device, dtype=torch.float)
+        if vocab_limit > 0 and vocab_embeds.shape[0] > vocab_limit:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(int(getattr(self.configs, "cluster_seed", getattr(self.configs, "seed", 0))) + 71)
+            ids = torch.randperm(vocab_embeds.shape[0], generator=generator, device=device)[:vocab_limit]
+            vocab_embeds = vocab_embeds[ids]
+
+        self.bridge.fit(ts_embeds, vocab_embeds, iters=kmeans_iters)
+        self.train(was_training)
+
+    def _predicted_vocab_embeddings(self, logits):
+        temperature = max(float(getattr(self.configs, "forecast_temperature", 1.0)), 1e-6)
+        top_k = int(getattr(self.configs, "forecast_top_k", 0))
+        vocab_weight = self._vocab_weight().to(device=logits.device, dtype=logits.dtype)
+
+        if top_k > 0 and top_k < logits.shape[-1]:
+            values, indices = torch.topk(logits, k=top_k, dim=-1)
+            probs = F.softmax(values / temperature, dim=-1)
+            selected = vocab_weight[indices]
+            embeds = torch.einsum("bfk,bfkd->bfd", probs, selected)
+            token_ids = indices[..., 0]
+            return embeds, token_ids
+
+        probs = F.softmax(logits / temperature, dim=-1)
+        embeds = torch.matmul(probs, vocab_weight)
+        token_ids = probs.argmax(dim=-1)
+        return embeds, token_ids
 
     def forecast(self, batch_x):
-        history_quant, history_ids = self.tokenizer_adapter.encode_history(batch_x)
-        history_projected = self.ts_to_gpt(history_quant)
-        history_embeds, history_entropy = self._map_to_codebook(history_projected)
+        history_patches = self.patch_tokenizer.patchify(batch_x)
+        history_ts_embeds = self.patch_tokenizer.encode(history_patches)
+        history_llm_embeds = self.bridge.map_ts_to_vocab_space(history_ts_embeds)
+        history_llm_embeds = self.output_dropout(history_llm_embeds)
 
         future_queries = self.future_queries.unsqueeze(0).expand(batch_x.shape[0], -1, -1)
-        future_embeds, future_entropy = self._map_to_codebook(future_queries)
-        inputs_embeds = torch.cat([history_embeds, future_embeds], dim=1)
-        attention_mask = torch.ones(
-            inputs_embeds.shape[:2],
-            dtype=torch.long,
-            device=inputs_embeds.device,
-        )
+        inputs_embeds = torch.cat([history_llm_embeds, future_queries], dim=1)
+        attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=batch_x.device)
 
-        outputs = self.gpt2(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
+        outputs = self.gpt2(inputs_embeds=inputs_embeds, attention_mask=attention_mask, output_hidden_states=True)
+        future_logits = outputs.logits[:, -self.future_patch_count :, :]
+        pred_vocab_embeds, pred_token_ids = self._predicted_vocab_embeddings(future_logits)
+
+        pred = self.decoder(pred_vocab_embeds, history_llm_embeds, history_patches)
+        pred = pred[:, : self.pred_len, : self.c_out]
+        aux = SimpleNamespace(
+            pred_token_ids=pred_token_ids,
+            pred_vocab_embeds=pred_vocab_embeds,
+            history_llm_embeds=history_llm_embeds,
+            history_ts_embeds=history_ts_embeds,
+            mapped_ts_centers=self.bridge.map_vocab_to_ts_center(pred_vocab_embeds),
         )
-        pred_hidden = outputs.hidden_states[-1][:, -self.future_queries.shape[0] :, :]
-        future_quant_raw = self.hidden_to_code(pred_hidden)
-        future_quant, output_entropy = self._map_to_codebook(future_quant_raw)
-        pred = self.tokenizer_adapter.decode_future(
-            batch_x,
-            history_quant,
-            future_quant,
-            self.pred_len,
-        )
-        return pred[:, :, : self.c_out], {
-            "history_ids": history_ids,
-            "history_quant": history_quant,
-            "future_quant": future_quant,
-            "mapping_entropy": history_entropy + future_entropy + output_entropy,
-        }
+        return pred, aux
 
     def forward(self, batch_x, batch_y=None):
         pred, aux = self.forecast(batch_x)
@@ -292,25 +381,4 @@ class Model(nn.Module):
         if batch_y is not None:
             target = batch_y[:, -self.pred_len :, : self.c_out]
             loss = F.mse_loss(pred, target)
-
-            lambda_latent = float(getattr(self.configs, "lambda_tokenizer_latent", 0.1))
-            if lambda_latent > 0:
-                target_future_quant, _ = self.tokenizer_adapter.encode_future_target(batch_x, target)
-                token_count = min(aux["future_quant"].shape[1], target_future_quant.shape[1])
-                loss = loss + lambda_latent * F.mse_loss(
-                    aux["future_quant"][:, :token_count, :],
-                    target_future_quant[:, :token_count, :],
-                )
-
-            lambda_diff = float(getattr(self.configs, "lambda_diff", 0.0))
-            if lambda_diff > 0 and self.pred_len > 1:
-                loss = loss + lambda_diff * F.mse_loss(
-                    pred[:, 1:, :] - pred[:, :-1, :],
-                    target[:, 1:, :] - target[:, :-1, :],
-                )
-
-            lambda_entropy = float(getattr(self.configs, "lambda_ts_mapping_entropy", 0.0))
-            if lambda_entropy != 0.0:
-                loss = loss + lambda_entropy * aux["mapping_entropy"]
-
         return SimpleNamespace(pred=pred, loss=loss, aux=aux)
