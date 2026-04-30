@@ -52,7 +52,17 @@ class KMeansBridge(nn.Module):
         self.register_buffer("ts_centers", torch.empty(0), persistent=True)
         self.register_buffer("vocab_centers", torch.empty(0), persistent=True)
         self.register_buffer("ts_to_vocab", torch.empty(0, dtype=torch.long), persistent=True)
+        self.register_buffer("cluster_fitted", torch.tensor(False), persistent=True)
         self.is_fitted = False
+
+    @property
+    def ready(self):
+        return bool(
+            self.cluster_fitted.item()
+            and self.ts_centers.numel() > 0
+            and self.vocab_centers.numel() > 0
+            and self.ts_to_vocab.numel() > 0
+        )
 
     def fit(self, ts_embeds, vocab_embeds, iters=8):
         device = ts_embeds.device
@@ -67,6 +77,7 @@ class KMeansBridge(nn.Module):
         generator = torch.Generator(device=device)
         generator.manual_seed(self.seed + 29)
         self.ts_to_vocab = torch.randperm(k, generator=generator, device=device)
+        self.cluster_fitted.fill_(True)
         self.is_fitted = True
 
     @torch.no_grad()
@@ -100,32 +111,44 @@ class KMeansBridge(nn.Module):
         source = F.normalize(embeds, dim=-1) if self.normalize else embeds
         centers = F.normalize(self.ts_centers, dim=-1) if self.normalize else self.ts_centers
         distances = torch.cdist(source.float(), centers.float())
-        return distances.argmin(dim=-1)
+        return distances.argmin(dim=-1), distances.min(dim=-1).values
 
     def _nearest_vocab_center(self, embeds):
         source = F.normalize(embeds, dim=-1) if self.normalize else embeds
         centers = F.normalize(self.vocab_centers, dim=-1) if self.normalize else self.vocab_centers
         distances = torch.cdist(source.float(), centers.float())
-        return distances.argmin(dim=-1)
+        return distances.argmin(dim=-1), distances.min(dim=-1).values
+
+    def _inverse_mapping(self):
+        inverse = torch.empty_like(self.ts_to_vocab)
+        inverse[self.ts_to_vocab] = torch.arange(self.ts_to_vocab.numel(), device=self.ts_to_vocab.device)
+        return inverse
 
     def map_ts_to_vocab_space(self, ts_embeds):
-        if not self.is_fitted or self.ts_centers.numel() == 0:
+        if not self.ready:
             return ts_embeds
-        center_ids = self._nearest_ts_center(ts_embeds)
+        center_ids, _ = self._nearest_ts_center(ts_embeds)
         ts_center = self.ts_centers[center_ids]
         vocab_center = self.vocab_centers[self.ts_to_vocab[center_ids]]
         residual = ts_embeds - ts_center.to(dtype=ts_embeds.dtype)
-        mapped = vocab_center.to(dtype=ts_embeds.dtype) + residual * self.residual_scale
+        direction = F.normalize(residual, dim=-1)
+        distance = residual.norm(dim=-1, keepdim=True)
+        mapped = vocab_center.to(dtype=ts_embeds.dtype) + direction * distance * self.residual_scale
         return mapped
 
-    def map_vocab_to_ts_center(self, vocab_embeds):
-        if not self.is_fitted or self.vocab_centers.numel() == 0:
+    def map_vocab_to_ts_space(self, vocab_embeds):
+        if not self.ready:
             return vocab_embeds
-        vocab_center_ids = self._nearest_vocab_center(vocab_embeds)
-        inverse = torch.empty_like(self.ts_to_vocab)
-        inverse[self.ts_to_vocab] = torch.arange(self.ts_to_vocab.numel(), device=self.ts_to_vocab.device)
+        vocab_center_ids, _ = self._nearest_vocab_center(vocab_embeds)
+        inverse = self._inverse_mapping()
         ts_center_ids = inverse[vocab_center_ids]
-        return self.ts_centers[ts_center_ids].to(dtype=vocab_embeds.dtype)
+        vocab_center = self.vocab_centers[vocab_center_ids]
+        ts_center = self.ts_centers[ts_center_ids]
+        residual = vocab_embeds - vocab_center.to(dtype=vocab_embeds.dtype)
+        direction = F.normalize(residual, dim=-1)
+        distance = residual.norm(dim=-1, keepdim=True)
+        inverse_scale = 1.0 / max(self.residual_scale, 1e-6)
+        return ts_center.to(dtype=vocab_embeds.dtype) + direction * distance * inverse_scale
 
 
 class PatchTokenizer(nn.Module):
@@ -147,6 +170,10 @@ class PatchTokenizer(nn.Module):
         if x.shape[1] < self.patch_len:
             pad_len = self.patch_len - x.shape[1]
             x = F.pad(x, (0, 0, 0, pad_len))
+        else:
+            remainder = (x.shape[1] - self.patch_len) % self.stride
+            if remainder:
+                x = F.pad(x, (0, 0, 0, self.stride - remainder))
         patches = x.unfold(dimension=1, size=self.patch_len, step=self.stride)
         patches = patches.permute(0, 1, 3, 2).contiguous()
         return patches
@@ -334,7 +361,7 @@ class Model(nn.Module):
 
     def _predicted_vocab_embeddings(self, logits):
         temperature = max(float(getattr(self.configs, "forecast_temperature", 1.0)), 1e-6)
-        top_k = int(getattr(self.configs, "forecast_top_k", 0))
+        top_k = int(getattr(self.configs, "forecast_top_k", 64))
         vocab_weight = self._vocab_weight().to(device=logits.device, dtype=logits.dtype)
 
         if top_k > 0 and top_k < logits.shape[-1]:
@@ -363,15 +390,17 @@ class Model(nn.Module):
         outputs = self.gpt2(inputs_embeds=inputs_embeds, attention_mask=attention_mask, output_hidden_states=True)
         future_logits = outputs.logits[:, -self.future_patch_count :, :]
         pred_vocab_embeds, pred_token_ids = self._predicted_vocab_embeddings(future_logits)
+        pred_ts_embeds = self.bridge.map_vocab_to_ts_space(pred_vocab_embeds)
 
-        pred = self.decoder(pred_vocab_embeds, history_llm_embeds, history_patches)
+        pred = self.decoder(pred_ts_embeds, history_ts_embeds, history_patches)
         pred = pred[:, : self.pred_len, : self.c_out]
         aux = SimpleNamespace(
             pred_token_ids=pred_token_ids,
             pred_vocab_embeds=pred_vocab_embeds,
+            pred_ts_embeds=pred_ts_embeds,
             history_llm_embeds=history_llm_embeds,
             history_ts_embeds=history_ts_embeds,
-            mapped_ts_centers=self.bridge.map_vocab_to_ts_center(pred_vocab_embeds),
+            mapped_ts_embeds=pred_ts_embeds,
         )
         return pred, aux
 
