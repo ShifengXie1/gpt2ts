@@ -6,32 +6,25 @@ import numpy as np
 import torch
 from torch import optim
 
+from exp.exp_basic import Exp_Basic
 from data_provider.data_factory import data_provider
 from models import gpt2ts
 from utils.metrics import metric
 from utils.tools import EarlyStopping, adjust_learning_rate
 
 
-class TokenLLM_Main:
+class Exp_Main(Exp_Basic):
     # 初始化实验入口，创建设备、模型和结果目录。
     def __init__(self, args):
-        self.args = args
-        self.device = self._acquire_device()
-        self.model = self._build_model().to(self.device)
+        super(Exp_Main, self).__init__(args) # 调用父类构造函数
+
         self.results_dir = args.results_dir if args.results_dir else "./results"
         os.makedirs(self.results_dir, exist_ok=True)
 
         self.min_test_loss = float("inf")
         self.min_test_mae = float("inf")
         self.epoch_for_min_test_loss = -1
-
-    # 根据运行参数选择当前实验使用的计算设备。
-    def _acquire_device(self):
-        if self.args.use_gpu:
-            if self.args.use_multi_gpu:
-                os.environ["CUDA_VISIBLE_DEVICES"] = self.args.devices
-            return torch.device(f"cuda:{self.args.gpu}")
-        return torch.device("cpu")
+        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # 构建 GPT2TS 模型实例。
     def _build_model(self):
@@ -50,21 +43,14 @@ class TokenLLM_Main:
     # 根据参数选择训练损失函数。
     def _select_criterion(self):
         criterions = {"mse": torch.nn.MSELoss(), "smoothL1": torch.nn.SmoothL1Loss()}
-        loss_name = getattr(self.args, "loss", "mse")
         try:
-            return criterions[loss_name]
+            return criterions[self.args.loss]
         except KeyError as exc:
-            raise ValueError(f"Invalid loss: {loss_name}") from exc
-
-    # 构建并返回当前实验的模型检查点目录。
-    def _checkpoint_dir(self, setting):
-        path = os.path.join(self.results_dir, setting, "checkpoints")
-        os.makedirs(path, exist_ok=True)
-        return path
+            raise ValueError(f"Invalid loss: {self.args.loss}") from exc
 
     # 构建并返回当前实验的结果保存目录。
     def _result_dir(self, setting):
-        path = os.path.join(self.results_dir, setting)
+        path = os.path.join(self.results_dir, setting, self.timestamp, "results")
         os.makedirs(path, exist_ok=True)
         return path
 
@@ -72,7 +58,7 @@ class TokenLLM_Main:
     def _save_test_results(self, setting, metrics):
         result_path = os.path.join(self.results_dir, "result.txt")
         with open(result_path, "w", encoding="utf-8") as file:
-            file.write(f"saved_at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            file.write(f"saved_at: {self.timestamp}\n")
             file.write(f"setting: {setting}\n")
             file.write(f"features: {self.args.features}\n")
             file.write(f"target_col: {self.args.target_col}\n")
@@ -81,71 +67,50 @@ class TokenLLM_Main:
                 "rmse={rmse:.6f}, mape={mape:.6f}, mspe={mspe:.6f}\n".format(**metrics)
             )
 
-    # 从 DataLoader 批数据中取出输入序列和目标序列。
-    def _unpack_batch(self, batch):
-        if len(batch) < 2:
-            raise ValueError("Expected a batch containing at least input and target tensors.")
-        return batch[0], batch[1]
-
-    # 从目标序列中截取预测长度对应的监督窗口。
-    def _target_window(self, target):
-        return target[:, -self.args.pred_len :, : self.args.c_out]
-
-    # 执行模型前向传播并兼容 AMP 混合精度。
-    def _forward_model(self, batch_x, target=None):
-        amp_enabled = bool(self.args.use_amp and self.device.type == "cuda")
-        with torch.cuda.amp.autocast(enabled=amp_enabled):
-            output = self.model(batch_x, target)
-        if hasattr(output, "pred"):
-            return output.pred
-        return output
-
     # 处理一个 batch，完成设备迁移、前向传播和真实值切片。
     def _process_one_batch(self, batch):
-        batch_x, target = self._unpack_batch(batch)
+        if len(batch) < 2:
+            raise ValueError("Expected a batch containing at least input and target tensors.")
+        batch_x, target = batch[0], batch[1]
+        
         batch_x = batch_x.to(dtype=torch.float, device=self.device)
         target = target.to(dtype=torch.float, device=self.device)
-        true = self._target_window(target)
-        pred = self._forward_model(batch_x, target)
-        return pred, true
-
-    # 在训练前基于训练集拟合时序聚类和词表聚类。
-    def _fit_clusters(self, train_loader):
-        if hasattr(self.model, "fit_token_clusters"):
-            print("\tFitting time/vocab embedding clusters ...")
-            self.model.fit_token_clusters(train_loader, device=self.device)
+        
+        if self.args.use_amp:
+            with torch.amp.autocast():
+                pred = self.model(batch_x) # 前向传播
+        else:
+            pred = self.model(batch_x) 
+        return pred, target
 
     # 在验证集或测试集上评估模型并返回 MSE 和 MAE。
     def vali(self, vali_data, vali_loader, criterion):
-        was_training = self.model.training
         self.model.eval()
         preds, trues = [], []
 
         with torch.no_grad():
             for batch in vali_loader:
                 pred, true = self._process_one_batch(batch)
-                preds.append(pred.detach())
-                trues.append(true.detach())
+                preds.append(pred)
+                trues.append(true)     
 
-        if was_training:
+            preds = torch.cat(preds, dim=0).cpu()
+            trues = torch.cat(trues, dim=0).cpu()
+            preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])
+            trues = trues.reshape(-1, trues.shape[-2], trues.shape[-1])
+
+            mae, mse, rmse, mape, mspe = metric(preds.numpy(), trues.numpy())
             self.model.train()
-
-        preds = torch.cat(preds, dim=0).cpu()
-        trues = torch.cat(trues, dim=0).cpu()
-        preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])
-        trues = trues.reshape(-1, trues.shape[-2], trues.shape[-1])
-
-        mae, mse, rmse, mape, mspe = metric(preds.numpy(), trues.numpy())
-        return mse, mae
+            return mse, mae
 
     # 执行完整训练流程，包括聚类拟合、训练循环、验证和早停。
-    def train(self, setting, optunaTrialReport=None):
+    def train(self, setting):
         train_data, train_loader = self._get_data(flag="train")
         vali_data, vali_loader = self._get_data(flag="val")
         test_data, test_loader = self._get_data(flag="test")
 
-        checkpoint_dir = self._checkpoint_dir(setting)
-        self._fit_clusters(train_loader)
+        checkpoint_dir = os.path.join(self.results_dir, setting, self.timestamp, "checkpoints")
+        os.makedirs(checkpoint_dir, exist_ok=True)
 
         train_steps = len(train_loader)
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
@@ -153,7 +118,7 @@ class TokenLLM_Main:
         criterion = self._select_criterion()
 
         amp_enabled = bool(self.args.use_amp and self.device.type == "cuda")
-        scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+        scaler = torch.amp.GradScaler(enabled=amp_enabled)
 
         for epoch in range(self.args.train_epochs):
             train_loss = []
@@ -186,8 +151,7 @@ class TokenLLM_Main:
 
             print("Epoch {}: cost time: {:.2f} sec".format(epoch + 1, time.time() - epoch_time))
             print(
-                "\tEpoch {0}: Steps- {1} | Train Loss: {2:.5f} "
-                "Vali.MSE: {3:.5f} Vali.MAE: {4:.5f} Test.MSE: {5:.5f} Test.MAE: {6:.5f}".format(
+                "\tEpoch {0}: Steps- {1} | Train Loss: {2:.5f} Vali.MSE: {3:.5f} Vali.MAE: {4:.5f} Test.MSE: {5:.5f} Test.MAE: {6:.5f}".format(
                     epoch + 1, train_steps, train_loss, vali_loss, vali_mae, test_loss, test_mae
                 )
             )
@@ -201,11 +165,6 @@ class TokenLLM_Main:
                 break
 
             adjust_learning_rate(model_optim, None, epoch + 1, self.args)
-
-            if optunaTrialReport is not None:
-                optunaTrialReport.report(vali_loss, epoch)
-                if optunaTrialReport.should_prune():
-                    break
 
         best_model_path = os.path.join(checkpoint_dir, "checkpoint.pth")
         self.model.load_state_dict(torch.load(best_model_path, map_location=self.device))

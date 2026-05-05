@@ -69,6 +69,10 @@ class KMeansBridge(nn.Module):
             and self.ts_to_vocab.numel() > 0
         )
 
+    @property
+    def vocab_ready(self):
+        return bool(self.vocab_centers.numel() > 0)
+
     # 分别拟合时序和词表嵌入的 KMeans 中心，并建立随机中心映射。
     def fit(self, ts_embeds, vocab_embeds, iters=8):
         device = ts_embeds.device
@@ -85,6 +89,15 @@ class KMeansBridge(nn.Module):
         self.ts_to_vocab = torch.randperm(k, generator=generator, device=device)
         self.cluster_fitted.fill_(True)
         self.is_fitted = True
+
+    # 仅拟合 GPT 词表 embedding 的 KMeans 中心。
+    def fit_vocab(self, vocab_embeds, iters=8):
+        k = min(self.num_clusters, vocab_embeds.shape[0])
+        if k <= 0:
+            raise ValueError("Cannot fit vocab clusters from empty embeddings.")
+
+        self.num_clusters = int(k)
+        self.vocab_centers = self._kmeans(vocab_embeds.float(), k, int(iters), self.seed + 13)
 
     # 使用简单 KMeans 在输入嵌入上估计聚类中心。
     @torch.no_grad()
@@ -277,12 +290,16 @@ class Model(nn.Module):
             gpt_dim=self.gpt_dim,
             dropout=getattr(configs, "embedding_dropout", getattr(configs, "dropout", 0.05)),
         )
+        cluster_seed = getattr(configs, "cluster_seed", None)
+        if cluster_seed is None:
+            cluster_seed = getattr(configs, "seed", 0)
         self.bridge = KMeansBridge(
             num_clusters=getattr(configs, "num_clusters", 64),
             residual_scale=getattr(configs, "cluster_residual_scale", 1.0),
             normalize=getattr(configs, "cluster_normalize", True),
-            seed=getattr(configs, "cluster_seed", getattr(configs, "seed", 0)),
+            seed=cluster_seed,
         )
+        self._fit_vocab_clusters()
 
         self.future_patch_count = self._patch_count_for_length(self.pred_len)
         self.future_queries = nn.Parameter(torch.empty(self.future_patch_count, self.gpt_dim))
@@ -347,43 +364,24 @@ class Model(nn.Module):
     def _vocab_weight(self):
         return self.gpt2.get_input_embeddings().weight.detach()
 
-    # 从训练数据中采样 patch 嵌入并拟合时序/词表聚类映射。
+    # 在模型初始化时筛选 GPT 词表 embedding 并拟合词表聚类中心。
     @torch.no_grad()
-    def fit_token_clusters(self, data_loader, device=None):
-        device = device or next(self.parameters()).device
-        sample_limit = int(getattr(self.configs, "cluster_sample_size", 8192))
+    def _fit_vocab_clusters(self):
+        num_clusters = int(getattr(self.configs, "num_clusters", 64))
+        if num_clusters <= 0:
+            return
+
         vocab_limit = int(getattr(self.configs, "vocab_cluster_sample_size", 20000))
         kmeans_iters = int(getattr(self.configs, "kmeans_iters", 8))
 
-        was_training = self.training
-        self.eval()
-        samples = []
-        seen = 0
-        for batch in data_loader:
-            batch_x = batch[0].to(device=device, dtype=torch.float)
-            patches = self.patch_tokenizer.patchify(batch_x)
-            embeds = self.patch_tokenizer.encode(patches).reshape(-1, self.gpt_dim)
-            samples.append(embeds.detach())
-            seen += embeds.shape[0]
-            if seen >= sample_limit:
-                break
-
-        if not samples:
-            raise ValueError("No patches found for fitting time-series clusters.")
-
-        ts_embeds = torch.cat(samples, dim=0)
-        if ts_embeds.shape[0] > sample_limit:
-            ts_embeds = ts_embeds[:sample_limit]
-
-        vocab_embeds = self._vocab_weight().to(device=device, dtype=torch.float)
+        vocab_embeds = self._vocab_weight().to(dtype=torch.float)
         if vocab_limit > 0 and vocab_embeds.shape[0] > vocab_limit:
-            generator = torch.Generator(device=device)
-            generator.manual_seed(int(getattr(self.configs, "cluster_seed", getattr(self.configs, "seed", 0))) + 71)
-            ids = torch.randperm(vocab_embeds.shape[0], generator=generator, device=device)[:vocab_limit]
+            generator = torch.Generator(device=vocab_embeds.device)
+            generator.manual_seed(self.bridge.seed + 71)
+            ids = torch.randperm(vocab_embeds.shape[0], generator=generator, device=vocab_embeds.device)[:vocab_limit]
             vocab_embeds = vocab_embeds[ids]
 
-        self.bridge.fit(ts_embeds, vocab_embeds, iters=kmeans_iters)
-        self.train(was_training)
+        self.bridge.fit_vocab(vocab_embeds, iters=kmeans_iters)
 
     # 将 GPT 输出 logits 转换为预测 token id 和对应词表 embedding。
     def _predicted_vocab_embeddings(self, logits):

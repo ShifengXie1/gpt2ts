@@ -3,19 +3,8 @@ import os
 
 import torch
 
-from exp.exp_main import TokenLLM_Main
+from exp.exp_main import Exp_Main
 from utils.tools import set_random_seed
-
-
-def str2bool(value):
-    if isinstance(value, bool):
-        return value
-    value = value.lower()
-    if value in ("true", "1", "yes", "y"):
-        return True
-    if value in ("false", "0", "no", "n"):
-        return False
-    raise argparse.ArgumentTypeError("Boolean value expected.")
 
 
 def build_args():
@@ -29,6 +18,7 @@ def build_args():
     '''模型参数'''
     parser.add_argument('--seq_len', type = int, default = 512, help = 'length of the look back window')
     parser.add_argument('--pred_len', type = int, default = 96, help = 'prediction length')
+    parser.add_argument('--label_len', type=int, default=0, help='label length')
     parser.add_argument('--d_model', type = int, default = 256, help = 'embedding dimension')
     parser.add_argument('--batch_size', type = int, default = 32, help = 'batch size')
     parser.add_argument('--learning_rate', type = float, default = 0.001, help = 'learning rate')
@@ -39,16 +29,15 @@ def build_args():
     parser.add_argument('--embedding_dropout', type = float, default = 0.05, help = 'dropout for embedding layer')
     parser.add_argument('--patience', type = int, default = 10, help = 'patience')
     parser.add_argument('--train_epochs', type = int, default = 10, help = 'train epochs')
-    parser.add_argument('--label_len', type=int, default=48, help='decoder label length used by the dataset window')
     parser.add_argument('--loss', type=str, default='mse', choices=['mse', 'smoothL1'])
     parser.add_argument('--lradj', type=str, default='none', help='learning-rate adjustment policy')
     parser.add_argument('--n_layers', type=int, default=0, help='number of GPT-2 layers to keep; 0 keeps all layers')
-    parser.add_argument('--num_clusters', type=int, default=64, help='number of clusters for time/vocab embeddings')
-    parser.add_argument('--cluster_sample_size', type=int, default=8192, help='max time-series patch embeddings sampled for k-means')
+    parser.add_argument('--num_clusters', type=int, default=64, help='number of clusters for GPT vocab embeddings')
+    parser.add_argument('--cluster_sample_size', type=int, default=8192, help='deprecated; kept for compatibility and ignored')
     parser.add_argument('--vocab_cluster_sample_size', type=int, default=20000, help='max vocab embeddings sampled for k-means')
     parser.add_argument('--kmeans_iters', type=int, default=8, help='k-means iterations')
     parser.add_argument('--cluster_residual_scale', type=float, default=1.0, help='scale for distance-preserving cluster residuals')
-    parser.add_argument('--cluster_normalize', type=str2bool, default=True, help='normalize embeddings when assigning clusters')
+    parser.add_argument('--cluster_normalize', type=bool, default=True, help='normalize embeddings when assigning clusters')
     parser.add_argument('--cluster_seed', type=int, default=None, help='seed for cluster init and random center mapping')
     parser.add_argument('--history_lookup_temperature', type=float, default=0.2, help='temperature for mapping predicted embeddings to history patches')
     parser.add_argument('--hard_patch_lookup', action='store_true', default=False, help='use nearest historical patch at evaluation time')
@@ -60,11 +49,11 @@ def build_args():
     parser.add_argument('--lora_target', type=str, default='c_attn,c_proj', help='comma-separated GPT-2 attention projection names')
     parser.add_argument('--gpt_local_path', type=str, default=None, help='local GPT-2 folder')
     parser.add_argument('--gpt_model_name', type=str, default='openai-community/gpt2', help='fallback HuggingFace GPT-2 model id')
-    parser.add_argument('--gpt_local_files_only', type=str2bool, default=True, help='load GPT-2 from local files only')
-    parser.add_argument('--use_pretrained_gpt2', type=str2bool, default=True, help='load pretrained GPT-2 weights')
+    parser.add_argument('--gpt_local_files_only', type=bool, default=True, help='load GPT-2 from local files only')
+    parser.add_argument('--use_pretrained_gpt2', type=bool, default=True, help='load pretrained GPT-2 weights')
     
     '''环境'''
-    parser.add_argument('--use_gpu', type = str2bool, default = True, help = 'use gpu')
+    parser.add_argument('--use_gpu', type = bool, default = True, help = 'use gpu')
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--results_dir", type=str, default="./results")
     parser.add_argument("--seed", type=int, default=0)
@@ -141,7 +130,7 @@ def main():
 
     setting = '{}_{}_dec-sl{}_pl{}_dm{}_bt{}_ptl{}_stl{}_sd{}'.format(args.model, args.data, args.seq_len, args.pred_len, args.d_model, args.batch_size, args.patch_len, args.stride, args.seed)
     
-    exp = TokenLLM_Main(args)
+    exp = Exp_Main(args)
     
     print('Start Training- {}'.format(setting))
     exp.train(setting)
