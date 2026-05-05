@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from transformers import AutoConfig, AutoModelForCausalLM
 
 
+# 从配置对象中读取布尔参数并提供默认值。
 def _get_bool(configs, name, default=False):
     return bool(getattr(configs, name, default))
 
@@ -15,6 +16,7 @@ def _get_bool(configs, name, default=False):
 class LoRAConv1D(nn.Module):
     """LoRA adapter for GPT-2's Conv1D projections."""
 
+    # 初始化 GPT-2 Conv1D 投影层的 LoRA 适配器。
     def __init__(self, base_layer, r=8, alpha=16, dropout=0.0):
         super().__init__()
         self.base_layer = base_layer
@@ -31,6 +33,7 @@ class LoRAConv1D(nn.Module):
         self.lora_B = nn.Parameter(torch.zeros(out_features, self.r))
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
 
+    # 前向计算基础投影和 LoRA 增量之和。
     def forward(self, x):
         base = self.base_layer(x)
         if self.r <= 0:
@@ -43,6 +46,7 @@ class LoRAConv1D(nn.Module):
 class KMeansBridge(nn.Module):
     """Maps time-series patch embeddings into GPT vocabulary-cluster space."""
 
+    # 初始化时序嵌入与词表嵌入之间的聚类映射桥。
     def __init__(self, num_clusters=64, residual_scale=1.0, normalize=True, seed=0):
         super().__init__()
         self.num_clusters = int(num_clusters)
@@ -55,6 +59,7 @@ class KMeansBridge(nn.Module):
         self.register_buffer("cluster_fitted", torch.tensor(False), persistent=True)
         self.is_fitted = False
 
+    # 判断聚类中心和随机映射是否已经拟合完成。
     @property
     def ready(self):
         return bool(
@@ -64,6 +69,7 @@ class KMeansBridge(nn.Module):
             and self.ts_to_vocab.numel() > 0
         )
 
+    # 分别拟合时序和词表嵌入的 KMeans 中心，并建立随机中心映射。
     def fit(self, ts_embeds, vocab_embeds, iters=8):
         device = ts_embeds.device
         k = min(self.num_clusters, ts_embeds.shape[0], vocab_embeds.shape[0])
@@ -80,6 +86,7 @@ class KMeansBridge(nn.Module):
         self.cluster_fitted.fill_(True)
         self.is_fitted = True
 
+    # 使用简单 KMeans 在输入嵌入上估计聚类中心。
     @torch.no_grad()
     def _kmeans(self, x, k, iters, seed):
         if x.ndim != 2:
@@ -107,23 +114,27 @@ class KMeansBridge(nn.Module):
             centers = new_centers
         return centers
 
+    # 查找每个时序嵌入最近的时序聚类中心。
     def _nearest_ts_center(self, embeds):
         source = F.normalize(embeds, dim=-1) if self.normalize else embeds
         centers = F.normalize(self.ts_centers, dim=-1) if self.normalize else self.ts_centers
         distances = torch.cdist(source.float(), centers.float())
         return distances.argmin(dim=-1), distances.min(dim=-1).values
 
+    # 查找每个词表嵌入最近的词表聚类中心。
     def _nearest_vocab_center(self, embeds):
         source = F.normalize(embeds, dim=-1) if self.normalize else embeds
         centers = F.normalize(self.vocab_centers, dim=-1) if self.normalize else self.vocab_centers
         distances = torch.cdist(source.float(), centers.float())
         return distances.argmin(dim=-1), distances.min(dim=-1).values
 
+    # 构建词表聚类中心到时序聚类中心的反向映射。
     def _inverse_mapping(self):
         inverse = torch.empty_like(self.ts_to_vocab)
         inverse[self.ts_to_vocab] = torch.arange(self.ts_to_vocab.numel(), device=self.ts_to_vocab.device)
         return inverse
 
+    # 将时序 patch 嵌入映射到词表聚类空间。
     def map_ts_to_vocab_space(self, ts_embeds):
         if not self.ready:
             return ts_embeds
@@ -136,6 +147,7 @@ class KMeansBridge(nn.Module):
         mapped = vocab_center.to(dtype=ts_embeds.dtype) + direction * distance * self.residual_scale
         return mapped
 
+    # 将预测出的词表嵌入反向映射回时序嵌入空间。
     def map_vocab_to_ts_space(self, vocab_embeds):
         if not self.ready:
             return vocab_embeds
@@ -152,6 +164,7 @@ class KMeansBridge(nn.Module):
 
 
 class PatchTokenizer(nn.Module):
+    # 初始化 patch 切分参数和 patch 到 GPT 维度的编码器。
     def __init__(self, patch_len, stride, c_in, gpt_dim, dropout=0.05):
         super().__init__()
         self.patch_len = int(patch_len)
@@ -166,6 +179,7 @@ class PatchTokenizer(nn.Module):
             nn.Linear(gpt_dim, gpt_dim),
         )
 
+    # 将输入时序按照 patch 长度和步长切分成重叠 patch。
     def patchify(self, x):
         if x.shape[1] < self.patch_len:
             pad_len = self.patch_len - x.shape[1]
@@ -178,12 +192,14 @@ class PatchTokenizer(nn.Module):
         patches = patches.permute(0, 1, 3, 2).contiguous()
         return patches
 
+    # 将 patch 拉平并编码到 GPT hidden size 维度。
     def encode(self, patches):
         flat = patches.reshape(patches.shape[0], patches.shape[1], -1)
         return self.encoder(flat)
 
 
 class HistoryPatchDecoder(nn.Module):
+    # 初始化基于历史 patch 检索的预测解码器。
     def __init__(self, patch_len, stride, pred_len, temperature=0.2, hard_lookup=False):
         super().__init__()
         self.patch_len = int(patch_len)
@@ -192,6 +208,7 @@ class HistoryPatchDecoder(nn.Module):
         self.temperature = max(float(temperature), 1e-6)
         self.hard_lookup = bool(hard_lookup)
 
+    # 根据预测嵌入在历史嵌入中检索对应 patch 并还原预测序列。
     def forward(self, pred_embeds, history_embeds, history_patches):
         query = F.normalize(pred_embeds, dim=-1)
         key = F.normalize(history_embeds, dim=-1)
@@ -207,6 +224,7 @@ class HistoryPatchDecoder(nn.Module):
 
         return self._overlap_add(pred_patches)
 
+    # 将多个预测 patch 按步长重叠相加恢复成连续时序。
     def _overlap_add(self, patches):
         batch, patch_count, _, channels = patches.shape
         output = patches.new_zeros(batch, self.pred_len, channels)
@@ -227,6 +245,7 @@ class HistoryPatchDecoder(nn.Module):
 class Model(nn.Module):
     """Patch-cluster GPT2 forecaster with LoRA-tuned attention."""
 
+    # 初始化 GPT2TS 主模型、聚类桥、LoRA 和历史 patch 解码器。
     def __init__(self, configs):
         super().__init__()
         self.configs = configs
@@ -278,11 +297,13 @@ class Model(nn.Module):
         )
         self.output_dropout = nn.Dropout(float(getattr(configs, "dropout", 0.05)))
 
+    # 根据序列长度、patch 长度和步长计算 patch 数量。
     def _patch_count_for_length(self, length):
         if length <= self.patch_len:
             return 1
         return math.ceil((length - self.patch_len) / self.stride) + 1
 
+    # 解析 GPT-2 本地路径或 HuggingFace 模型名称。
     def _resolve_gpt2_path(self):
         local_path = getattr(self.configs, "gpt_local_path", None)
         if local_path:
@@ -291,6 +312,7 @@ class Model(nn.Module):
             return "./gpt"
         return getattr(self.configs, "gpt_model_name", "openai-community/gpt2")
 
+    # 根据配置加载预训练 GPT-2 或随机初始化 GPT-2。
     def _load_gpt2(self, config):
         if _get_bool(self.configs, "use_pretrained_gpt2", True):
             return AutoModelForCausalLM.from_pretrained(
@@ -300,10 +322,12 @@ class Model(nn.Module):
             )
         return AutoModelForCausalLM.from_config(config)
 
+    # 冻结 GPT-2 原始参数，只保留外接模块或 LoRA 可训练。
     def _freeze_gpt2(self):
         for param in self.gpt2.parameters():
             param.requires_grad = False
 
+    # 将 LoRA 适配器注入 GPT-2 attention 投影层。
     def _inject_lora(self):
         r = int(getattr(self.configs, "lora_r", 8))
         if r <= 0:
@@ -319,9 +343,11 @@ class Model(nn.Module):
             if "c_proj" in targets:
                 block.attn.c_proj = LoRAConv1D(block.attn.c_proj, r=r, alpha=alpha, dropout=dropout)
 
+    # 获取 GPT-2 输入词表 embedding 权重。
     def _vocab_weight(self):
         return self.gpt2.get_input_embeddings().weight.detach()
 
+    # 从训练数据中采样 patch 嵌入并拟合时序/词表聚类映射。
     @torch.no_grad()
     def fit_token_clusters(self, data_loader, device=None):
         device = device or next(self.parameters()).device
@@ -359,6 +385,7 @@ class Model(nn.Module):
         self.bridge.fit(ts_embeds, vocab_embeds, iters=kmeans_iters)
         self.train(was_training)
 
+    # 将 GPT 输出 logits 转换为预测 token id 和对应词表 embedding。
     def _predicted_vocab_embeddings(self, logits):
         temperature = max(float(getattr(self.configs, "forecast_temperature", 1.0)), 1e-6)
         top_k = int(getattr(self.configs, "forecast_top_k", 64))
@@ -377,6 +404,7 @@ class Model(nn.Module):
         token_ids = probs.argmax(dim=-1)
         return embeds, token_ids
 
+    # 执行时序预测主流程，从历史序列生成未来预测序列。
     def forecast(self, batch_x):
         history_patches = self.patch_tokenizer.patchify(batch_x)
         history_ts_embeds = self.patch_tokenizer.encode(history_patches)
@@ -404,6 +432,7 @@ class Model(nn.Module):
         )
         return pred, aux
 
+    # 模型前向接口，返回预测、可选损失和辅助信息。
     def forward(self, batch_x, batch_y=None):
         pred, aux = self.forecast(batch_x)
         loss = None

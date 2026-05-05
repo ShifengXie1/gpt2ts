@@ -13,6 +13,7 @@ from utils.tools import EarlyStopping, adjust_learning_rate
 
 
 class TokenLLM_Main:
+    # 初始化实验入口，创建设备、模型和结果目录。
     def __init__(self, args):
         self.args = args
         self.device = self._acquire_device()
@@ -24,6 +25,7 @@ class TokenLLM_Main:
         self.min_test_mae = float("inf")
         self.epoch_for_min_test_loss = -1
 
+    # 根据运行参数选择当前实验使用的计算设备。
     def _acquire_device(self):
         if self.args.use_gpu:
             if self.args.use_multi_gpu:
@@ -31,17 +33,21 @@ class TokenLLM_Main:
             return torch.device(f"cuda:{self.args.gpu}")
         return torch.device("cpu")
 
+    # 构建 GPT2TS 模型实例。
     def _build_model(self):
         return gpt2ts.Model(self.args).float()
 
+    # 根据数据划分标记加载数据集和 DataLoader。
     def _get_data(self, flag):
         data_set, data_loader = data_provider(self.args, flag)
         return data_set, data_loader
 
+    # 选择优化器并只优化可训练参数。
     def _select_optimizer(self):
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         return optim.Adam(trainable_params, lr=self.args.learning_rate, weight_decay=self.args.weight_decay)
 
+    # 根据参数选择训练损失函数。
     def _select_criterion(self):
         criterions = {"mse": torch.nn.MSELoss(), "smoothL1": torch.nn.SmoothL1Loss()}
         loss_name = getattr(self.args, "loss", "mse")
@@ -50,16 +56,19 @@ class TokenLLM_Main:
         except KeyError as exc:
             raise ValueError(f"Invalid loss: {loss_name}") from exc
 
+    # 构建并返回当前实验的模型检查点目录。
     def _checkpoint_dir(self, setting):
         path = os.path.join(self.results_dir, setting, "checkpoints")
         os.makedirs(path, exist_ok=True)
         return path
 
+    # 构建并返回当前实验的结果保存目录。
     def _result_dir(self, setting):
         path = os.path.join(self.results_dir, setting)
         os.makedirs(path, exist_ok=True)
         return path
 
+    # 将测试指标写入文本结果文件。
     def _save_test_results(self, setting, metrics):
         result_path = os.path.join(self.results_dir, "result.txt")
         with open(result_path, "w", encoding="utf-8") as file:
@@ -72,14 +81,17 @@ class TokenLLM_Main:
                 "rmse={rmse:.6f}, mape={mape:.6f}, mspe={mspe:.6f}\n".format(**metrics)
             )
 
+    # 从 DataLoader 批数据中取出输入序列和目标序列。
     def _unpack_batch(self, batch):
         if len(batch) < 2:
             raise ValueError("Expected a batch containing at least input and target tensors.")
         return batch[0], batch[1]
 
+    # 从目标序列中截取预测长度对应的监督窗口。
     def _target_window(self, target):
         return target[:, -self.args.pred_len :, : self.args.c_out]
 
+    # 执行模型前向传播并兼容 AMP 混合精度。
     def _forward_model(self, batch_x, target=None):
         amp_enabled = bool(self.args.use_amp and self.device.type == "cuda")
         with torch.cuda.amp.autocast(enabled=amp_enabled):
@@ -88,6 +100,7 @@ class TokenLLM_Main:
             return output.pred
         return output
 
+    # 处理一个 batch，完成设备迁移、前向传播和真实值切片。
     def _process_one_batch(self, batch):
         batch_x, target = self._unpack_batch(batch)
         batch_x = batch_x.to(dtype=torch.float, device=self.device)
@@ -96,11 +109,13 @@ class TokenLLM_Main:
         pred = self._forward_model(batch_x, target)
         return pred, true
 
+    # 在训练前基于训练集拟合时序聚类和词表聚类。
     def _fit_clusters(self, train_loader):
         if hasattr(self.model, "fit_token_clusters"):
             print("\tFitting time/vocab embedding clusters ...")
             self.model.fit_token_clusters(train_loader, device=self.device)
 
+    # 在验证集或测试集上评估模型并返回 MSE 和 MAE。
     def vali(self, vali_data, vali_loader, criterion):
         was_training = self.model.training
         self.model.eval()
@@ -123,6 +138,7 @@ class TokenLLM_Main:
         mae, mse, rmse, mape, mspe = metric(preds.numpy(), trues.numpy())
         return mse, mae
 
+    # 执行完整训练流程，包括聚类拟合、训练循环、验证和早停。
     def train(self, setting, optunaTrialReport=None):
         train_data, train_loader = self._get_data(flag="train")
         vali_data, vali_loader = self._get_data(flag="val")
@@ -195,6 +211,7 @@ class TokenLLM_Main:
         self.model.load_state_dict(torch.load(best_model_path, map_location=self.device))
         return self.model
 
+    # 在测试集上推理、计算指标并保存预测结果。
     def test(self, setting):
         test_data, test_loader = self._get_data(flag="test")
         criterion = self._select_criterion()
