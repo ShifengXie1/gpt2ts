@@ -48,25 +48,6 @@ class Exp_Main(Exp_Basic):
         except KeyError as exc:
             raise ValueError(f"Invalid loss: {self.args.loss}") from exc
 
-    # 构建并返回当前实验的结果保存目录。
-    def _result_dir(self, setting):
-        path = os.path.join(self.results_dir, setting, self.timestamp, "results")
-        os.makedirs(path, exist_ok=True)
-        return path
-
-    # 将测试指标写入文本结果文件。
-    def _save_test_results(self, setting, metrics):
-        result_path = os.path.join(self.results_dir, "result.txt")
-        with open(result_path, "w", encoding="utf-8") as file:
-            file.write(f"saved_at: {self.timestamp}\n")
-            file.write(f"setting: {setting}\n")
-            file.write(f"features: {self.args.features}\n")
-            file.write(f"target_col: {self.args.target_col}\n")
-            file.write(
-                "test_loss={test_loss:.6f} | mse={mse:.6f}, mae={mae:.6f}, "
-                "rmse={rmse:.6f}, mape={mape:.6f}, mspe={mspe:.6f}\n".format(**metrics)
-            )
-
     # 处理一个 batch，完成设备迁移、前向传播和真实值切片。
     def _process_one_batch(self, batch):
         if len(batch) < 2:
@@ -192,10 +173,11 @@ class Exp_Main(Exp_Basic):
         test_loss = criterion(preds, trues).item()
         print("mse: {}, mae: {}".format(mse, mae))
 
-        result_dir = self._result_dir(setting)
-        np.save(os.path.join(result_dir, "metrics.npy"), np.array([mae, mse, rmse, mape, mspe]))
-        np.save(os.path.join(result_dir, "pred.npy"), preds.numpy())
-        np.save(os.path.join(result_dir, "true.npy"), trues.numpy())
+        save_dir = os.path.join(self.results_dir, setting, self.timestamp)
+        os.makedirs(save_dir, exist_ok=True)
+        np.save(os.path.join(save_dir, "metrics.npy"), np.array([mae, mse, rmse, mape, mspe]))
+        np.save(os.path.join(save_dir, "pred.npy"), preds.numpy())
+        np.save(os.path.join(save_dir, "true.npy"), trues.numpy())
 
         metrics = {
             "test_loss": test_loss,
@@ -205,5 +187,16 @@ class Exp_Main(Exp_Basic):
             "mape": mape,
             "mspe": mspe,
         }
-        self._save_test_results(setting, metrics)
+        
+        result_path = os.path.join(self.results_dir, "result.txt")
+        with open(result_path, "w", encoding="utf-8") as file:
+            file.write(f"saved_at: {self.timestamp}\n")
+            file.write(f"setting: {setting}\n")
+            file.write(f"features: {self.args.features}\n")
+            file.write(f"target_col: {self.args.target_col}\n")
+            file.write(
+                "test_loss={test_loss:.6f} | mse={mse:.6f}, mae={mae:.6f}, "
+                "rmse={rmse:.6f}, mape={mape:.6f}, mspe={mspe:.6f}\n".format(**metrics)
+            )
+            
         return mse, mae
