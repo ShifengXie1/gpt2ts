@@ -171,15 +171,56 @@ class Exp_Main(Exp_Basic):
         return self.model
 
     # Test and save results.
+    def _save_batch_curve_view(self, pred_batch, true_batch, save_dir, max_samples=8, max_channels=8):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        pred_batch = pred_batch.detach().cpu().numpy()
+        true_batch = true_batch.detach().cpu().numpy()
+        sample_count = min(pred_batch.shape[0], max_samples)
+        channel_count = min(pred_batch.shape[-1], max_channels)
+        horizon = np.arange(pred_batch.shape[1])
+
+        view_dir = os.path.join(save_dir, "batch_view")
+        os.makedirs(view_dir, exist_ok=True)
+        np.save(os.path.join(view_dir, "batch_pred.npy"), pred_batch)
+        np.save(os.path.join(view_dir, "batch_true.npy"), true_batch)
+
+        fig, axes = plt.subplots(
+            sample_count,
+            channel_count,
+            figsize=(3.2 * channel_count, 2.2 * sample_count),
+            squeeze=False,
+        )
+        for sample_idx in range(sample_count):
+            for channel_idx in range(channel_count):
+                ax = axes[sample_idx][channel_idx]
+                ax.plot(horizon, true_batch[sample_idx, :, channel_idx], label="true", linewidth=1.2)
+                ax.plot(horizon, pred_batch[sample_idx, :, channel_idx], label="pred", linewidth=1.2)
+                ax.set_title(f"sample {sample_idx} | channel {channel_idx}", fontsize=8)
+                ax.tick_params(axis="both", labelsize=7)
+                if sample_idx == 0 and channel_idx == 0:
+                    ax.legend(fontsize=7)
+
+        fig.suptitle("Test batch prediction vs true", fontsize=12)
+        fig.tight_layout()
+        fig.savefig(os.path.join(view_dir, "batch_prediction_vs_true.png"), dpi=160)
+        plt.close(fig)
+
     def test(self, setting):
         test_data, test_loader = self._get_data(flag="test")
         criterion = self._select_criterion()
         self.model.eval()
         preds, trues = [], []
+        view_pred, view_true = None, None
 
         with torch.no_grad():
             for batch in test_loader:
                 pred, true = self._process_one_batch(batch)
+                if view_pred is None:
+                    view_pred = pred.detach()
+                    view_true = true.detach()
                 preds.append(pred.detach())
                 trues.append(true.detach())
 
@@ -197,6 +238,8 @@ class Exp_Main(Exp_Basic):
         np.save(os.path.join(save_dir, "metrics.npy"), np.array([mae, mse, rmse, mape, mspe]))
         np.save(os.path.join(save_dir, "pred.npy"), preds.numpy())
         np.save(os.path.join(save_dir, "true.npy"), trues.numpy())
+        if view_pred is not None and view_true is not None:
+            self._save_batch_curve_view(view_pred, view_true, save_dir)
 
         metrics = {
             "test_loss": test_loss,
