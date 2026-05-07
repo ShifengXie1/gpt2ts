@@ -203,19 +203,19 @@ class KMeansBridge(nn.Module):
         return mapped
 
     # Map vocab embeds back to time-series space.
-    def map_vocab_to_ts_space(self, vocab_embeds):
-        if not self.ready:
-            return vocab_embeds
-        vocab_center_ids, _ = self._nearest_vocab_center(vocab_embeds)
-        inverse = self._inverse_mapping()
-        ts_center_ids = inverse[vocab_center_ids]
-        vocab_center = self.vocab_centers[vocab_center_ids]
-        ts_center = self.ts_centers[ts_center_ids]
-        residual = vocab_embeds - vocab_center.to(dtype=vocab_embeds.dtype)
-        direction = F.normalize(residual, dim=-1)
-        distance = residual.norm(dim=-1, keepdim=True)
-        inverse_scale = 1.0 / max(self.residual_scale, 1e-6)
-        return ts_center.to(dtype=vocab_embeds.dtype) + direction * distance * inverse_scale
+    # def map_vocab_to_ts_space(self, vocab_embeds):
+    #     if not self.ready:
+    #         return vocab_embeds
+    #     vocab_center_ids, _ = self._nearest_vocab_center(vocab_embeds)
+    #     inverse = self._inverse_mapping()
+    #     ts_center_ids = inverse[vocab_center_ids]
+    #     vocab_center = self.vocab_centers[vocab_center_ids]
+    #     ts_center = self.ts_centers[ts_center_ids]
+    #     residual = vocab_embeds - vocab_center.to(dtype=vocab_embeds.dtype)
+    #     direction = F.normalize(residual, dim=-1)
+    #     distance = residual.norm(dim=-1, keepdim=True)
+    #     inverse_scale = 1.0 / max(self.residual_scale, 1e-6)
+    #     return ts_center.to(dtype=vocab_embeds.dtype) + direction * distance * inverse_scale
 
     # Map vocab embeds to the paired time-series cluster centers only.
     def map_vocab_to_ts_center(self, vocab_embeds):

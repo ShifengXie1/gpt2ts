@@ -32,7 +32,6 @@ def build_args():
     parser.add_argument('--lradj', type=str, default='none', help='learning-rate adjustment policy')
     parser.add_argument('--n_layers', type=int, default=0, help='number of GPT-2 layers to keep; 0 keeps all layers')
     parser.add_argument('--num_clusters', type=int, default=64, help='number of clusters for GPT vocab embeddings')
-    parser.add_argument('--cluster_sample_size', type=int, default=8192, help='deprecated; kept for compatibility and ignored')
     parser.add_argument('--cluster_residual_scale', type=float, default=1.0, help='scale for distance-preserving cluster residuals')
     parser.add_argument('--cluster_normalize', type=bool, default=True, help='normalize embeddings when assigning clusters')
     parser.add_argument('--cluster_seed', type=int, default=None, help='seed for cluster init and random center mapping')
