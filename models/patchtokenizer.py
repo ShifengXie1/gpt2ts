@@ -25,6 +25,9 @@ class PatchTokenizer(nn.Module):
         patches = patches.permute(0, 1, 3, 2).contiguous()
         return patches
 
-    def encode(self, patches):
+    def encode(self, patches, apply_dropout=True):
         flat = patches.reshape(patches.shape[0], patches.shape[1], -1)
-        return self.dropout(self.projection(flat))
+        embeds = self.projection(flat)
+        if apply_dropout:
+            embeds = self.dropout(embeds)
+        return embeds

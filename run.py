@@ -37,6 +37,10 @@ def build_args():
     parser.add_argument('--cluster_seed', type=int, default=None, help='seed for cluster init and random center mapping')
     parser.add_argument('--forecast_temperature', type=float, default=1.0, help='temperature for token embedding prediction')
     parser.add_argument('--forecast_top_k', type=int, default=64, help='use top-k token embeddings for differentiable predicted embedding')
+    parser.add_argument('--aux_token_loss_weight', type=float, default=0.0, help='weight for future-token auxiliary cross entropy')
+    parser.add_argument('--aux_embed_loss_weight', type=float, default=0.0, help='weight for future-embedding auxiliary alignment')
+    parser.add_argument('--aux_temperature', type=float, default=1.0, help='temperature for auxiliary soft embedding loss')
+    parser.add_argument('--aux_embed_top_k', type=int, default=64, help='top-k vocab embeddings used by auxiliary embedding loss')
     parser.add_argument('--retrieval_temperature', type=float, default=1.0, help='temperature for key-value memory retrieval')
     parser.add_argument(
         '--retrieval_mode',

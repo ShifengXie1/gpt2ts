@@ -383,6 +383,76 @@ class GPT2TS(nn.Module):
         token_ids = probs.argmax(dim=-1)
         return embeds, token_ids
 
+    def _soft_vocab_embeddings(self, logits):
+        temperature = max(float(getattr(self.configs, "aux_temperature", 1.0)), 1e-6)
+        top_k = int(getattr(self.configs, "aux_embed_top_k", 64))
+        vocab_weight = self._vocab_weight().to(device=logits.device, dtype=logits.dtype)
+
+        if top_k > 0 and top_k < logits.shape[-1]:
+            values, indices = torch.topk(logits, k=top_k, dim=-1)
+            probs = F.softmax(values / temperature, dim=-1)
+            selected = vocab_weight[indices]
+            return torch.einsum("bfk,bfkd->bfd", probs, selected)
+
+        probs = F.softmax(logits / temperature, dim=-1)
+        return torch.matmul(probs, vocab_weight)
+
+    @torch.no_grad()
+    def _nearest_vocab_token_ids(self, vocab_embeds):
+        vocab_weight = self._vocab_weight().to(device=vocab_embeds.device, dtype=torch.float)
+        source = F.normalize(vocab_embeds.float(), dim=-1)
+        vocab = F.normalize(vocab_weight, dim=-1)
+        scores = torch.matmul(source.reshape(-1, source.shape[-1]), vocab.transpose(0, 1))
+        return scores.argmax(dim=-1).reshape(vocab_embeds.shape[:-1])
+
+    @torch.no_grad()
+    def _target_future_embeddings(self, batch_y):
+        target = batch_y[:, -self.pred_len :, :]
+        if target.shape[-1] != self.c_in:
+            return None, None
+
+        target_patches = self.patch_tokenizer.patchify(target)
+        target_patches = target_patches[:, : self.future_patch_count, :, :]
+        target_ts_embeds = self.patch_tokenizer.encode(target_patches, apply_dropout=False)
+        target_vocab_embeds = self.bridge.map_ts_to_vocab_space(target_ts_embeds)
+        return target_ts_embeds.detach(), target_vocab_embeds.detach()
+
+    def _auxiliary_loss(self, batch_y, aux):
+        token_weight = float(getattr(self.configs, "aux_token_loss_weight", 0.0))
+        embed_weight = float(getattr(self.configs, "aux_embed_loss_weight", 0.0))
+        if token_weight <= 0.0 and embed_weight <= 0.0:
+            return None, {}
+
+        target_ts_embeds, target_vocab_embeds = self._target_future_embeddings(batch_y)
+        if target_ts_embeds is None:
+            return None, {}
+
+        total = aux.future_logits.new_zeros(())
+        losses = {}
+
+        if token_weight > 0.0:
+            target_token_ids = self._nearest_vocab_token_ids(target_vocab_embeds)
+            token_loss = F.cross_entropy(
+                aux.future_logits.reshape(-1, aux.future_logits.shape[-1]).float(),
+                target_token_ids.reshape(-1),
+            )
+            total = total + token_weight * token_loss.to(dtype=total.dtype)
+            losses["aux_token_loss"] = token_loss.detach()
+            losses["aux_target_token_ids"] = target_token_ids.detach()
+
+        if embed_weight > 0.0:
+            pred_vocab_embeds = self._soft_vocab_embeddings(aux.future_logits)
+            pred = F.normalize(pred_vocab_embeds.float(), dim=-1)
+            target = F.normalize(target_vocab_embeds.float(), dim=-1)
+            embed_loss = F.mse_loss(pred, target)
+            total = total + embed_weight * embed_loss.to(dtype=total.dtype)
+            losses["aux_embed_loss"] = embed_loss.detach()
+
+        losses["aux_total_loss"] = total.detach()
+        losses["target_ts_embeds"] = target_ts_embeds
+        losses["target_vocab_embeds"] = target_vocab_embeds
+        return total, losses
+
     # Forecast future values.
     def forecast(self, batch_x):
         history_patches = self.patch_tokenizer.patchify(batch_x)
@@ -404,6 +474,7 @@ class GPT2TS(nn.Module):
         pred = self.decoder(pred_patches)
         pred = pred[:, : self.pred_len, :]
         aux = SimpleNamespace(
+            future_logits=future_logits,
             pred_token_ids=pred_token_ids,
             pred_vocab_embeds=pred_vocab_embeds,
             pred_ts_embeds=pred_ts_embeds,
@@ -426,5 +497,7 @@ class GPT2TS(nn.Module):
         pred, aux = self.forecast(batch_x)
         loss = None
         if batch_y is not None:
-            loss = F.mse_loss(pred, batch_y)
+            loss, aux_losses = self._auxiliary_loss(batch_y, aux)
+            for name, value in aux_losses.items():
+                setattr(aux, name, value)
         return SimpleNamespace(pred=pred, loss=loss, aux=aux)

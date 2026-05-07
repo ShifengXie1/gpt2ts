@@ -19,6 +19,8 @@ STRIDE=8
 N_LAYERS=0
 NUM_CLUSTERS=64
 FORECAST_TOP_K=1
+AUX_TOKEN_LOSS_WEIGHT=0.05
+AUX_EMBED_LOSS_WEIGHT=0.1
 LORA_R=8
 LORA_ALPHA=16
 LORA_DROPOUT=0.05
@@ -40,6 +42,8 @@ for pred_len in "${PRED_LENS[@]}"; do
         --n_layers "$N_LAYERS" \
         --num_clusters "$NUM_CLUSTERS" \
         --forecast_top_k "$FORECAST_TOP_K" \
+        --aux_token_loss_weight "$AUX_TOKEN_LOSS_WEIGHT" \
+        --aux_embed_loss_weight "$AUX_EMBED_LOSS_WEIGHT" \
         --lora_r "$LORA_R" \
         --lora_alpha "$LORA_ALPHA" \
         --lora_dropout "$LORA_DROPOUT" \

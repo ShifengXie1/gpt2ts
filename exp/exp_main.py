@@ -61,21 +61,24 @@ class Exp_Main(Exp_Basic):
         return pred, target
 
     # Process one batch.
-    def _process_one_batch(self, batch):
+    def _process_one_batch(self, batch, return_output=False):
         if len(batch) < 2:
             raise ValueError("Expected a batch containing at least input and target tensors.")
         batch_x, target = batch[0], batch[1]
         
         batch_x = batch_x.to(dtype=torch.float, device=self.device)
         target = target.to(dtype=torch.float, device=self.device)
+        model_target = target if return_output else None
         
         if self.amp_enabled:
             with torch.amp.autocast(device_type=self.device.type, enabled=self.amp_enabled):
-                output = self.model(batch_x)
+                output = self.model(batch_x, model_target)
         else:
-            output = self.model(batch_x) 
+            output = self.model(batch_x, model_target) 
         pred = output.pred if hasattr(output, "pred") else output
         pred, target = self._align_prediction_and_target(pred, target)
+        if return_output:
+            return pred, target, output
         return pred, target
 
     # Evaluate a split.
@@ -122,8 +125,10 @@ class Exp_Main(Exp_Basic):
 
             for batch in train_loader:
                 model_optim.zero_grad(set_to_none=True)
-                pred, true = self._process_one_batch(batch)
-                loss = criterion(pred, true)
+                pred, true, output = self._process_one_batch(batch, return_output=True)
+                main_loss = criterion(pred, true)
+                aux_loss = output.loss if hasattr(output, "loss") else None
+                loss = main_loss if aux_loss is None else main_loss + aux_loss
 
                 if self.amp_enabled:
                     scaler.scale(loss).backward()
