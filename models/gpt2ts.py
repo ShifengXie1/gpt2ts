@@ -217,6 +217,28 @@ class KMeansBridge(nn.Module):
         inverse_scale = 1.0 / max(self.residual_scale, 1e-6)
         return ts_center.to(dtype=vocab_embeds.dtype) + direction * distance * inverse_scale
 
+    # Map vocab embeds to the paired time-series cluster centers only.
+    def map_vocab_to_ts_center(self, vocab_embeds):
+        if not self.ready:
+            empty_ids = torch.empty(vocab_embeds.shape[:-1], dtype=torch.long, device=vocab_embeds.device)
+            aux = SimpleNamespace(
+                vocab_center_ids=empty_ids,
+                ts_center_ids=empty_ids,
+                vocab_center_distances=torch.empty(vocab_embeds.shape[:-1], device=vocab_embeds.device),
+            )
+            return vocab_embeds, aux
+
+        vocab_center_ids, vocab_center_distances = self._nearest_vocab_center(vocab_embeds)
+        inverse = self._inverse_mapping()
+        ts_center_ids = inverse[vocab_center_ids]
+        ts_centers = self.ts_centers[ts_center_ids].to(device=vocab_embeds.device, dtype=vocab_embeds.dtype)
+        aux = SimpleNamespace(
+            vocab_center_ids=vocab_center_ids,
+            ts_center_ids=ts_center_ids,
+            vocab_center_distances=vocab_center_distances,
+        )
+        return ts_centers, aux
+
 
 class GPT2TS(nn.Module):
     """Patch-cluster GPT2 forecaster with LoRA-tuned attention."""
@@ -343,6 +365,11 @@ class GPT2TS(nn.Module):
         top_k = int(getattr(self.configs, "forecast_top_k", 64))
         vocab_weight = self._vocab_weight().to(device=logits.device, dtype=logits.dtype)
 
+        if top_k == 1:
+            token_ids = logits.argmax(dim=-1)
+            embeds = vocab_weight[token_ids]
+            return embeds, token_ids
+
         if top_k > 0 and top_k < logits.shape[-1]:
             values, indices = torch.topk(logits, k=top_k, dim=-1)
             probs = F.softmax(values / temperature, dim=-1)
@@ -371,7 +398,7 @@ class GPT2TS(nn.Module):
         outputs = self.gpt2(inputs_embeds=inputs_embeds, attention_mask=attention_mask, output_hidden_states=True)
         future_logits = outputs.logits[:, -self.future_patch_count :, :]
         pred_vocab_embeds, pred_token_ids = self._predicted_vocab_embeddings(future_logits)
-        pred_ts_embeds = self.bridge.map_vocab_to_ts_space(pred_vocab_embeds)
+        pred_ts_embeds, cluster_mapping = self.bridge.map_vocab_to_ts_center(pred_vocab_embeds)
 
         pred_patches, retrieval = self.memory_retriever(pred_ts_embeds, history_ts_embeds, history_patches)
         pred = self.decoder(pred_patches)
@@ -381,6 +408,9 @@ class GPT2TS(nn.Module):
             pred_vocab_embeds=pred_vocab_embeds,
             pred_ts_embeds=pred_ts_embeds,
             pred_patches=pred_patches,
+            pred_vocab_center_ids=cluster_mapping.vocab_center_ids,
+            pred_ts_center_ids=cluster_mapping.ts_center_ids,
+            pred_vocab_center_distances=cluster_mapping.vocab_center_distances,
             retrieval_indices=retrieval.indices,
             retrieval_weights=retrieval.weights,
             retrieval_scores=retrieval.scores,
