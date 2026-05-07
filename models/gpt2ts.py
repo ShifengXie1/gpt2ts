@@ -65,6 +65,8 @@ class KMeansBridge(nn.Module):
             self.register_buffer("vocab_centers", torch.empty(self.num_clusters, self.embed_dim), persistent=True)
             self.register_buffer("ts_to_vocab", torch.arange(self.num_clusters, dtype=torch.long), persistent=True)
         self.register_buffer("cluster_fitted", torch.tensor(False), persistent=True)
+        self.register_buffer("vocab_token_center_ids", torch.empty(0, dtype=torch.long), persistent=False)
+        self.register_buffer("vocab_token_center_distances", torch.empty(0), persistent=False)
         self.is_fitted = False
 
     def _resize_for_checkpoint(self, state_dict, prefix):
@@ -131,6 +133,7 @@ class KMeansBridge(nn.Module):
 
         self.num_clusters = int(k)
         self.vocab_centers = self._kmeans(vocab_embeds.float(), k, self.seed + 13)
+        self._assign_vocab_tokens(vocab_embeds.float())
 
     # Estimate centers with simple KMeans.
     @torch.no_grad()
@@ -183,6 +186,61 @@ class KMeansBridge(nn.Module):
         distances = torch.cdist(source.float(), centers.float())
         return distances.argmin(dim=-1), distances.min(dim=-1).values
 
+    # Assign each real GPT vocab embedding to its nearest vocab cluster center.
+    @torch.no_grad()
+    def _assign_vocab_tokens(self, vocab_embeds):
+        center_ids, _ = self._nearest_vocab_center(vocab_embeds)
+        centers = self.vocab_centers[center_ids].to(device=vocab_embeds.device, dtype=vocab_embeds.dtype)
+        center_distances = (vocab_embeds - centers).norm(dim=-1)
+        self.vocab_token_center_ids = center_ids.detach()
+        self.vocab_token_center_distances = center_distances.detach()
+
+    def _ensure_vocab_token_assignments(self, vocab_embeds):
+        if (
+            self.vocab_token_center_ids.shape[:1] != vocab_embeds.shape[:1]
+            or self.vocab_token_center_ids.device != vocab_embeds.device
+            or self.vocab_token_center_distances.device != vocab_embeds.device
+        ):
+            self._assign_vocab_tokens(vocab_embeds.float())
+
+    def _match_by_center_distance(self, query_center_ids, target_distances, candidate_center_ids, candidate_distances):
+        flat_center_ids = query_center_ids.reshape(-1)
+        flat_target_distances = target_distances.detach().reshape(-1).float()
+        candidate_center_ids = candidate_center_ids.to(device=flat_center_ids.device)
+        candidate_distances = candidate_distances.detach().to(device=flat_center_ids.device).float()
+
+        selected_ids = []
+        selected_distances = []
+        selected_errors = []
+        used_fallback = []
+        chunk_size = 256
+        max_error = torch.finfo(flat_target_distances.dtype).max
+
+        for start in range(0, flat_center_ids.numel(), chunk_size):
+            end = min(start + chunk_size, flat_center_ids.numel())
+            center_chunk = flat_center_ids[start:end]
+            target_chunk = flat_target_distances[start:end]
+            same_cluster = candidate_center_ids.unsqueeze(0) == center_chunk.unsqueeze(-1)
+            has_cluster_candidate = same_cluster.any(dim=-1, keepdim=True)
+            all_candidates = torch.ones_like(same_cluster, dtype=torch.bool)
+            candidate_mask = torch.where(has_cluster_candidate, same_cluster, all_candidates)
+            errors = (candidate_distances.unsqueeze(0) - target_chunk.unsqueeze(-1)).abs()
+            masked_errors = errors.masked_fill(~candidate_mask, max_error)
+
+            chunk_selected_ids = masked_errors.argmin(dim=-1)
+            selected_ids.append(chunk_selected_ids)
+            selected_distances.append(candidate_distances[chunk_selected_ids])
+            selected_errors.append(masked_errors.gather(dim=1, index=chunk_selected_ids.unsqueeze(-1)).squeeze(-1))
+            used_fallback.append(~has_cluster_candidate.squeeze(-1))
+
+        output_shape = query_center_ids.shape
+        return SimpleNamespace(
+            selected_ids=torch.cat(selected_ids, dim=0).reshape(output_shape),
+            selected_distances=torch.cat(selected_distances, dim=0).reshape(output_shape),
+            selected_errors=torch.cat(selected_errors, dim=0).reshape(output_shape),
+            used_fallback=torch.cat(used_fallback, dim=0).reshape(output_shape),
+        )
+
     # Build vocab-to-time inverse map.
     def _inverse_mapping(self):
         inverse = torch.empty_like(self.ts_to_vocab)
@@ -202,20 +260,132 @@ class KMeansBridge(nn.Module):
         mapped = vocab_center.to(dtype=ts_embeds.dtype) + direction * distance * self.residual_scale
         return mapped
 
-    # Map vocab embeds back to time-series space.
-    # def map_vocab_to_ts_space(self, vocab_embeds):
-    #     if not self.ready:
-    #         return vocab_embeds
-    #     vocab_center_ids, _ = self._nearest_vocab_center(vocab_embeds)
-    #     inverse = self._inverse_mapping()
-    #     ts_center_ids = inverse[vocab_center_ids]
-    #     vocab_center = self.vocab_centers[vocab_center_ids]
-    #     ts_center = self.ts_centers[ts_center_ids]
-    #     residual = vocab_embeds - vocab_center.to(dtype=vocab_embeds.dtype)
-    #     direction = F.normalize(residual, dim=-1)
-    #     distance = residual.norm(dim=-1, keepdim=True)
-    #     inverse_scale = 1.0 / max(self.residual_scale, 1e-6)
-    #     return ts_center.to(dtype=vocab_embeds.dtype) + direction * distance * inverse_scale
+    # Map time-series embeds to real GPT vocab embeddings by distance matching.
+    def map_ts_to_vocab_embedding(self, ts_embeds, vocab_embeds):
+        if ts_embeds.ndim != 3 or vocab_embeds.ndim != 2:
+            raise ValueError("Expected ts_embeds [B,N,D] and vocab_embeds [V,D].")
+        if ts_embeds.shape[-1] != vocab_embeds.shape[-1]:
+            raise ValueError("Time-series and vocab embeddings must share embedding dimension.")
+        if not self.ready:
+            source = F.normalize(ts_embeds.float(), dim=-1)
+            vocab = F.normalize(vocab_embeds.float(), dim=-1)
+            scores = torch.matmul(source.reshape(-1, source.shape[-1]), vocab.transpose(0, 1))
+            selected_vocab_token_ids = scores.argmax(dim=-1).reshape(ts_embeds.shape[:-1])
+            selected_vocab_embeds = vocab_embeds[selected_vocab_token_ids].to(device=ts_embeds.device, dtype=ts_embeds.dtype)
+            unknown_ids = torch.full(ts_embeds.shape[:-1], -1, dtype=torch.long, device=ts_embeds.device)
+            zero_distances = torch.zeros(ts_embeds.shape[:-1], device=ts_embeds.device, dtype=ts_embeds.dtype)
+            aux = SimpleNamespace(
+                ts_center_ids=unknown_ids,
+                vocab_center_ids=unknown_ids,
+                ts_center_distances=zero_distances,
+                ts_residual_distances=zero_distances,
+                target_vocab_distances=zero_distances,
+                selected_vocab_token_ids=selected_vocab_token_ids,
+                selected_vocab_center_ids=unknown_ids,
+                selected_vocab_distances=zero_distances,
+                selected_distance_errors=zero_distances,
+                used_vocab_cluster_fallback=torch.ones(ts_embeds.shape[:-1], dtype=torch.bool, device=ts_embeds.device),
+            )
+            return selected_vocab_embeds, aux
+
+        self._ensure_vocab_token_assignments(vocab_embeds)
+        ts_center_ids, ts_center_distances = self._nearest_ts_center(ts_embeds)
+        vocab_center_ids = self.ts_to_vocab[ts_center_ids]
+        ts_center = self.ts_centers[ts_center_ids].to(device=ts_embeds.device, dtype=ts_embeds.dtype)
+
+        ts_residual = ts_embeds - ts_center
+        ts_residual_distances = ts_residual.norm(dim=-1)
+        target_vocab_distances = ts_residual_distances * self.residual_scale
+        matched = self._match_by_center_distance(
+            vocab_center_ids,
+            target_vocab_distances,
+            self.vocab_token_center_ids,
+            self.vocab_token_center_distances,
+        )
+
+        selected_vocab_embeds = vocab_embeds[matched.selected_ids].to(device=ts_embeds.device, dtype=ts_embeds.dtype)
+        selected_vocab_center_ids = self.vocab_token_center_ids[matched.selected_ids].to(device=ts_embeds.device)
+        aux = SimpleNamespace(
+            ts_center_ids=ts_center_ids,
+            vocab_center_ids=vocab_center_ids,
+            ts_center_distances=ts_center_distances,
+            ts_residual_distances=ts_residual_distances,
+            target_vocab_distances=target_vocab_distances,
+            selected_vocab_token_ids=matched.selected_ids,
+            selected_vocab_center_ids=selected_vocab_center_ids,
+            selected_vocab_distances=matched.selected_distances.to(device=ts_embeds.device),
+            selected_distance_errors=matched.selected_errors.to(device=ts_embeds.device),
+            used_vocab_cluster_fallback=matched.used_fallback.to(device=ts_embeds.device),
+        )
+        return selected_vocab_embeds, aux
+
+    # Map vocab embeds to real history time-series embeddings by inverse distance matching.
+    def map_vocab_to_history_ts_embedding(self, vocab_embeds, history_ts_embeds):
+        if not self.ready:
+            empty_ids = torch.empty(vocab_embeds.shape[:-1], dtype=torch.long, device=vocab_embeds.device)
+            empty_distances = torch.empty(vocab_embeds.shape[:-1], device=vocab_embeds.device)
+            aux = SimpleNamespace(
+                vocab_center_ids=empty_ids,
+                ts_center_ids=empty_ids,
+                vocab_center_distances=empty_distances,
+                vocab_residual_distances=empty_distances,
+                target_ts_distances=empty_distances,
+                selected_history_indices=empty_ids,
+                selected_history_center_ids=empty_ids,
+                selected_ts_distances=empty_distances,
+                selected_distance_errors=empty_distances,
+                used_cluster_fallback=torch.empty(vocab_embeds.shape[:-1], dtype=torch.bool, device=vocab_embeds.device),
+            )
+            return vocab_embeds, aux
+        if vocab_embeds.ndim != 3 or history_ts_embeds.ndim != 3:
+            raise ValueError("Expected vocab_embeds [B,F,D] and history_ts_embeds [B,N,D].")
+        if vocab_embeds.shape[0] != history_ts_embeds.shape[0] or vocab_embeds.shape[-1] != history_ts_embeds.shape[-1]:
+            raise ValueError("Vocab and history embeddings must share batch and embedding dimensions.")
+
+        vocab_center_ids, vocab_center_distances = self._nearest_vocab_center(vocab_embeds)
+        inverse = self._inverse_mapping()
+        ts_center_ids = inverse[vocab_center_ids]
+        vocab_center = self.vocab_centers[vocab_center_ids].to(device=vocab_embeds.device, dtype=vocab_embeds.dtype)
+        ts_center = self.ts_centers[ts_center_ids].to(device=vocab_embeds.device, dtype=vocab_embeds.dtype)
+
+        vocab_residual = vocab_embeds - vocab_center
+        vocab_residual_distances = vocab_residual.norm(dim=-1)
+        inverse_scale = 1.0 / max(self.residual_scale, 1e-6)
+        target_ts_distances = vocab_residual_distances * inverse_scale
+
+        detached_history_ts_embeds = history_ts_embeds.detach()
+        detached_ts_center = ts_center.detach()
+        history_center_ids, _ = self._nearest_ts_center(detached_history_ts_embeds)
+        history_distances = (detached_history_ts_embeds.unsqueeze(1) - detached_ts_center.unsqueeze(2)).norm(dim=-1)
+        distance_errors = (history_distances - target_ts_distances.detach().unsqueeze(-1)).abs()
+
+        same_cluster = history_center_ids.unsqueeze(1) == ts_center_ids.unsqueeze(-1)
+        has_cluster_candidate = same_cluster.any(dim=-1, keepdim=True)
+        all_candidates = torch.ones_like(same_cluster, dtype=torch.bool)
+        candidate_mask = torch.where(has_cluster_candidate, same_cluster, all_candidates)
+        max_error = torch.finfo(distance_errors.dtype).max
+        masked_errors = distance_errors.masked_fill(~candidate_mask, max_error)
+
+        selected_history_indices = masked_errors.argmin(dim=-1)
+        gather_index = selected_history_indices.unsqueeze(-1).expand(-1, -1, history_ts_embeds.shape[-1])
+        selected_ts_embeds = history_ts_embeds.gather(dim=1, index=gather_index)
+        selected_ts_distances = history_distances.gather(dim=2, index=selected_history_indices.unsqueeze(-1)).squeeze(-1)
+        selected_distance_errors = masked_errors.gather(dim=2, index=selected_history_indices.unsqueeze(-1)).squeeze(-1)
+        selected_history_center_ids = history_center_ids.gather(dim=1, index=selected_history_indices)
+
+        aux = SimpleNamespace(
+            vocab_center_ids=vocab_center_ids,
+            ts_center_ids=ts_center_ids,
+            vocab_center_distances=vocab_center_distances,
+            vocab_residual_distances=vocab_residual_distances,
+            target_ts_distances=target_ts_distances,
+            selected_history_indices=selected_history_indices,
+            selected_history_center_ids=selected_history_center_ids,
+            selected_ts_distances=selected_ts_distances,
+            selected_distance_errors=selected_distance_errors,
+            used_cluster_fallback=~has_cluster_candidate.squeeze(-1),
+        )
+        return selected_ts_embeds, aux
 
     # Map vocab embeds to the paired time-series cluster centers only.
     def map_vocab_to_ts_center(self, vocab_embeds):
@@ -409,13 +579,18 @@ class GPT2TS(nn.Module):
     def _target_future_embeddings(self, batch_y):
         target = batch_y[:, -self.pred_len :, :]
         if target.shape[-1] != self.c_in:
-            return None, None
+            return None, None, None
 
         target_patches = self.patch_tokenizer.patchify(target)
         target_patches = target_patches[:, : self.future_patch_count, :, :]
         target_ts_embeds = self.patch_tokenizer.encode(target_patches, apply_dropout=False)
-        target_vocab_embeds = self.bridge.map_ts_to_vocab_space(target_ts_embeds)
-        return target_ts_embeds.detach(), target_vocab_embeds.detach()
+        vocab_weight = self._vocab_weight().to(device=target_ts_embeds.device, dtype=target_ts_embeds.dtype)
+        target_vocab_embeds, target_vocab_mapping = self.bridge.map_ts_to_vocab_embedding(target_ts_embeds, vocab_weight)
+        return (
+            target_ts_embeds.detach(),
+            target_vocab_embeds.detach(),
+            target_vocab_mapping.selected_vocab_token_ids.detach(),
+        )
 
     def _auxiliary_loss(self, batch_y, aux):
         token_weight = float(getattr(self.configs, "aux_token_loss_weight", 0.0))
@@ -423,7 +598,7 @@ class GPT2TS(nn.Module):
         if token_weight <= 0.0 and embed_weight <= 0.0:
             return None, {}
 
-        target_ts_embeds, target_vocab_embeds = self._target_future_embeddings(batch_y)
+        target_ts_embeds, target_vocab_embeds, target_token_ids = self._target_future_embeddings(batch_y)
         if target_ts_embeds is None:
             return None, {}
 
@@ -431,7 +606,6 @@ class GPT2TS(nn.Module):
         losses = {}
 
         if token_weight > 0.0:
-            target_token_ids = self._nearest_vocab_token_ids(target_vocab_embeds)
             token_loss = F.cross_entropy(
                 aux.future_logits.reshape(-1, aux.future_logits.shape[-1]).float(),
                 target_token_ids.reshape(-1),
@@ -458,7 +632,11 @@ class GPT2TS(nn.Module):
         history_patches = self.patch_tokenizer.patchify(batch_x)
         history_ts_embeds = self.patch_tokenizer.encode(history_patches)
         self._fit_history_clusters(history_ts_embeds)
-        history_llm_embeds = self.bridge.map_ts_to_vocab_space(history_ts_embeds)
+        vocab_weight = self._vocab_weight().to(device=batch_x.device, dtype=history_ts_embeds.dtype)
+        history_llm_embeds, history_vocab_mapping = self.bridge.map_ts_to_vocab_embedding(
+            history_ts_embeds,
+            vocab_weight,
+        )
         history_llm_embeds = self.output_dropout(history_llm_embeds)
 
         future_queries = self.future_query.unsqueeze(0).expand(batch_x.shape[0], self.future_patch_count, -1)
@@ -468,7 +646,10 @@ class GPT2TS(nn.Module):
         outputs = self.gpt2(inputs_embeds=inputs_embeds, attention_mask=attention_mask, output_hidden_states=True)
         future_logits = outputs.logits[:, -self.future_patch_count :, :]
         pred_vocab_embeds, pred_token_ids = self._predicted_vocab_embeddings(future_logits)
-        pred_ts_embeds, cluster_mapping = self.bridge.map_vocab_to_ts_center(pred_vocab_embeds)
+        pred_ts_embeds, cluster_mapping = self.bridge.map_vocab_to_history_ts_embedding(
+            pred_vocab_embeds,
+            history_ts_embeds,
+        )
 
         pred_patches, retrieval = self.memory_retriever(pred_ts_embeds, history_ts_embeds, history_patches)
         pred = self.decoder(pred_patches)
@@ -482,12 +663,26 @@ class GPT2TS(nn.Module):
             pred_vocab_center_ids=cluster_mapping.vocab_center_ids,
             pred_ts_center_ids=cluster_mapping.ts_center_ids,
             pred_vocab_center_distances=cluster_mapping.vocab_center_distances,
+            pred_vocab_residual_distances=cluster_mapping.vocab_residual_distances,
+            pred_target_ts_distances=cluster_mapping.target_ts_distances,
+            pred_selected_history_indices=cluster_mapping.selected_history_indices,
+            pred_selected_history_center_ids=cluster_mapping.selected_history_center_ids,
+            pred_selected_ts_distances=cluster_mapping.selected_ts_distances,
+            pred_selected_distance_errors=cluster_mapping.selected_distance_errors,
+            pred_used_cluster_fallback=cluster_mapping.used_cluster_fallback,
             retrieval_indices=retrieval.indices,
             retrieval_weights=retrieval.weights,
             retrieval_scores=retrieval.scores,
             history_patches=history_patches,
             history_llm_embeds=history_llm_embeds,
             history_ts_embeds=history_ts_embeds,
+            history_vocab_center_ids=history_vocab_mapping.vocab_center_ids,
+            history_selected_vocab_token_ids=history_vocab_mapping.selected_vocab_token_ids,
+            history_selected_vocab_center_ids=history_vocab_mapping.selected_vocab_center_ids,
+            history_target_vocab_distances=history_vocab_mapping.target_vocab_distances,
+            history_selected_vocab_distances=history_vocab_mapping.selected_vocab_distances,
+            history_selected_vocab_distance_errors=history_vocab_mapping.selected_distance_errors,
+            history_used_vocab_cluster_fallback=history_vocab_mapping.used_vocab_cluster_fallback,
             mapped_ts_embeds=pred_ts_embeds,
         )
         return pred, aux
