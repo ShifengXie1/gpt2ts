@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoConfig, AutoModelForCausalLM
 
-from models.patchdecoder import OverlapAddPatchDecoder
+from models.patchdecoder import KeyValueMemoryRetriever, OverlapAddPatchDecoder
 from models.patchtokenizer import PatchTokenizer
 
 
@@ -274,6 +274,11 @@ class GPT2TS(nn.Module):
         nn.init.normal_(self.future_query, mean=0.0, std=self.gpt_dim ** -0.5)
 
         # decoder
+        self.memory_retriever = KeyValueMemoryRetriever(
+            temperature=getattr(configs, "retrieval_temperature", 1.0),
+            mode=getattr(configs, "retrieval_mode", "straight_through"),
+            normalize=getattr(configs, "retrieval_normalize", True),
+        )
         self.decoder = OverlapAddPatchDecoder(
             patch_len=self.patch_len,
             stride=self.stride,
@@ -368,7 +373,7 @@ class GPT2TS(nn.Module):
         pred_vocab_embeds, pred_token_ids = self._predicted_vocab_embeddings(future_logits)
         pred_ts_embeds = self.bridge.map_vocab_to_ts_space(pred_vocab_embeds)
 
-        pred_patches = self.patch_tokenizer.decode(pred_ts_embeds)
+        pred_patches, retrieval = self.memory_retriever(pred_ts_embeds, history_ts_embeds, history_patches)
         pred = self.decoder(pred_patches)
         pred = pred[:, : self.pred_len, :]
         aux = SimpleNamespace(
@@ -376,6 +381,10 @@ class GPT2TS(nn.Module):
             pred_vocab_embeds=pred_vocab_embeds,
             pred_ts_embeds=pred_ts_embeds,
             pred_patches=pred_patches,
+            retrieval_indices=retrieval.indices,
+            retrieval_weights=retrieval.weights,
+            retrieval_scores=retrieval.scores,
+            history_patches=history_patches,
             history_llm_embeds=history_llm_embeds,
             history_ts_embeds=history_ts_embeds,
             mapped_ts_embeds=pred_ts_embeds,

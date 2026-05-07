@@ -23,7 +23,7 @@ def build_args():
     parser.add_argument('--learning_rate', type = float, default = 0.001, help = 'learning rate')
     parser.add_argument('--weight_decay', type = float, default = 0.00, help = 'pytorch weight decay factor')
     parser.add_argument('--patch_len', type = int, default = 16, help = 'Patch size')
-    parser.add_argument('--stride', type = int, default = 8, help = 'Stride')
+    parser.add_argument('--stride', type = int, default = 16, help = 'Stride')
     parser.add_argument('--dropout', type = float, default = 0.05, help = 'dropout for output layer')
     parser.add_argument('--embedding_dropout', type = float, default = 0.05, help = 'dropout for embedding layer')
     parser.add_argument('--patience', type = int, default = 10, help = 'patience')
@@ -38,6 +38,14 @@ def build_args():
     parser.add_argument('--cluster_seed', type=int, default=None, help='seed for cluster init and random center mapping')
     parser.add_argument('--forecast_temperature', type=float, default=1.0, help='temperature for token embedding prediction')
     parser.add_argument('--forecast_top_k', type=int, default=64, help='use top-k token embeddings for differentiable predicted embedding')
+    parser.add_argument('--retrieval_temperature', type=float, default=1.0, help='temperature for key-value memory retrieval')
+    parser.add_argument(
+        '--retrieval_mode',
+        type=str,
+        default='straight_through',
+        choices=['soft', 'hard', 'straight_through'],
+        help='memory retrieval mode for predicted patches',
+    )
     parser.add_argument('--lora_r', type=int, default=8, help='LoRA rank for GPT-2 attention projections')
     parser.add_argument('--lora_alpha', type=float, default=16.0, help='LoRA alpha')
     parser.add_argument('--lora_dropout', type=float, default=0.05, help='LoRA dropout')
