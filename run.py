@@ -10,12 +10,12 @@ from utils.tools import set_random_seed
 def build_args():
     parser = argparse.ArgumentParser()
     
-    '''模型'''
+    # Model
     parser.add_argument('--model', type = str, required = False, choices = ['gpt2ts'], default = 'gpt2ts', help = 'model of experiment')
     parser.add_argument('--task_name', type = str, required = False, choices = ['long_term_forecast'], default = 'long_term_forecast')
     parser.add_argument('--is_training', type=int, default=1, help='kept for script compatibility')
     
-    '''模型参数'''
+    # Model params
     parser.add_argument('--seq_len', type = int, default = 512, help = 'length of the look back window')
     parser.add_argument('--pred_len', type = int, default = 96, help = 'prediction length')
     parser.add_argument('--label_len', type=int, default=0, help='label length')
@@ -46,7 +46,7 @@ def build_args():
     parser.add_argument('--gpt_local_files_only', type=bool, default=True, help='load GPT-2 from local files only')
     parser.add_argument('--use_pretrained_gpt2', type=bool, default=True, help='load pretrained GPT-2 weights')
     
-    '''环境'''
+    # Environment
     parser.add_argument('--use_gpu', type = bool, default = True, help = 'use gpu')
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--results_dir", type=str, default="./results")
@@ -56,7 +56,7 @@ def build_args():
     parser.add_argument('--use_amp', action = 'store_true', help = 'use automatic mixed precision training', default = False)
     parser.add_argument('--num_workers', type=int, default=0, help='DataLoader workers')
     
-    '''输入数据'''
+    # Input data
     parser.add_argument('--data', type = str, default = 'ETTh1', choices = ['ETTh1', 'ETTh2', 'ETTm1', 'ETTm2', 'Electricity', 'Weather', 'Traffic'], help = 'dataset')
     parser.add_argument("--features", type=str, default="M", choices=["M", "S", "MS"])
     parser.add_argument("--data_path", type=str, default=None)
@@ -74,7 +74,7 @@ def build_args():
 
     args = parser.parse_args()
     
-    '''GPU设置'''
+    # GPU setup
     args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
     if args.use_gpu and args.use_multi_gpu:
         args.devices = args.devices.replace(' ','')
@@ -83,7 +83,7 @@ def build_args():
         args.gpu = args.device_ids[0]
 
     
-    '''数据集'''
+    # Dataset presets
     data_parser = {
         'ETTh1': {'data': 'ETTh1.csv', 'root_path': './data/ETT/', 'T': 'OT', 'freq': 'h', 'M': [7, 7], 'S': [1, 1], 'MS': [7, 1]},
         'ETTh2': {'data': 'ETTh2.csv', 'root_path': './data/ETT/', 'T': 'OT', 'freq': 'h', 'M': [7, 7], 'S': [1, 1], 'MS': [7, 1]},
@@ -110,7 +110,7 @@ def build_args():
 def build_results_dir(args):
     results_dir = args.results_dir if hasattr(args, "results_dir") else "./results"
     os.makedirs(results_dir, exist_ok=True)
-    return 
+    return results_dir
 
 
 def main():

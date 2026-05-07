@@ -13,6 +13,7 @@ class PatchTokenizer(nn.Module):
         self.gpt_dim = int(gpt_dim)
         self.pinv_rtol = float(pinv_rtol)
         self.projection = nn.Linear(self.patch_dim, self.gpt_dim)
+        self.dropout = nn.Dropout(float(dropout))
 
     def patchify(self, x):
         if x.shape[1] < self.patch_len:
@@ -28,7 +29,7 @@ class PatchTokenizer(nn.Module):
 
     def encode(self, patches):
         flat = patches.reshape(patches.shape[0], patches.shape[1], -1)
-        return self.projection(flat)
+        return self.dropout(self.projection(flat))
 
     def decode(self, embeds):
         weight = self.projection.weight.float().transpose(0, 1)

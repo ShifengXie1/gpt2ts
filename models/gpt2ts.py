@@ -18,7 +18,7 @@ KMEANS_MAX_ITERS = 100
 class LoRAConv1D(nn.Module):
     """LoRA adapter for GPT-2's Conv1D projections."""
 
-    # 初始化 GPT-2 Conv1D 投影层的 LoRA 适配器。
+    # Initialize LoRA for Conv1D.
     def __init__(self, base_layer, r=8, alpha=16, dropout=0.0):
         super().__init__()
         self.base_layer = base_layer
@@ -35,7 +35,7 @@ class LoRAConv1D(nn.Module):
         self.lora_B = nn.Parameter(torch.zeros(out_features, self.r))
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
 
-    # 前向计算基础投影和 LoRA 增量之和。
+    # Add the LoRA update.
     def forward(self, x):
         base = self.base_layer(x)
         if self.r <= 0:
@@ -48,14 +48,14 @@ class LoRAConv1D(nn.Module):
 class KMeansBridge(nn.Module):
     """Maps time-series patch embeddings into GPT vocabulary-cluster space."""
 
-    # 初始化时序嵌入与词表嵌入之间的聚类映射桥。
+    # Initialize the cluster bridge.
     def __init__(self, num_clusters=64, embed_dim=None, residual_scale=1.0, normalize=True, seed=0):
         super().__init__()
         self.num_clusters = int(num_clusters)
         self.embed_dim = None if embed_dim is None else int(embed_dim)
         self.residual_scale = float(residual_scale)
         self.normalize = bool(normalize)
-        self.seed = int(seed)
+        self.seed = 0 if seed is None else int(seed)
         if self.embed_dim is None or self.num_clusters <= 0:
             self.register_buffer("ts_centers", torch.empty(0), persistent=True)
             self.register_buffer("vocab_centers", torch.empty(0), persistent=True)
@@ -91,7 +91,7 @@ class KMeansBridge(nn.Module):
             error_msgs,
         )
 
-    # 判断聚类中心和随机映射是否已经拟合完成。
+    # Check whether both cluster sets are ready.
     @property
     def ready(self):
         return bool(
@@ -123,7 +123,7 @@ class KMeansBridge(nn.Module):
         self.cluster_fitted.fill_(True)
         self.is_fitted = True
 
-    # 仅拟合 GPT 词表 embedding 的 KMeans 中心。
+    # Fit GPT vocab centers only.
     def fit_vocab(self, vocab_embeds):
         k = self.num_clusters
         if k <= 0:
@@ -132,7 +132,7 @@ class KMeansBridge(nn.Module):
         self.num_clusters = int(k)
         self.vocab_centers = self._kmeans(vocab_embeds.float(), k, self.seed + 13)
 
-    # 使用简单 KMeans 在输入嵌入上估计聚类中心。
+    # Estimate centers with simple KMeans.
     @torch.no_grad()
     def _kmeans(self, x, k, seed):
         if x.ndim != 2:
@@ -169,27 +169,27 @@ class KMeansBridge(nn.Module):
             previous_assign = assign
         return centers
 
-    # 查找每个时序嵌入最近的时序聚类中心。
+    # Find nearest time-series centers.
     def _nearest_ts_center(self, embeds):
         source = F.normalize(embeds, dim=-1) if self.normalize else embeds
         centers = F.normalize(self.ts_centers, dim=-1) if self.normalize else self.ts_centers
         distances = torch.cdist(source.float(), centers.float())
         return distances.argmin(dim=-1), distances.min(dim=-1).values
 
-    # 查找每个词表嵌入最近的词表聚类中心。
+    # Find nearest vocab centers.
     def _nearest_vocab_center(self, embeds):
         source = F.normalize(embeds, dim=-1) if self.normalize else embeds
         centers = F.normalize(self.vocab_centers, dim=-1) if self.normalize else self.vocab_centers
         distances = torch.cdist(source.float(), centers.float())
         return distances.argmin(dim=-1), distances.min(dim=-1).values
 
-    # 构建词表聚类中心到时序聚类中心的反向映射。
+    # Build vocab-to-time inverse map.
     def _inverse_mapping(self):
         inverse = torch.empty_like(self.ts_to_vocab)
         inverse[self.ts_to_vocab] = torch.arange(self.ts_to_vocab.numel(), device=self.ts_to_vocab.device)
         return inverse
 
-    # 将时序 patch 嵌入映射到词表聚类空间。
+    # Map time-series embeds to vocab space.
     def map_ts_to_vocab_space(self, ts_embeds):
         if not self.ready:
             return ts_embeds
@@ -202,7 +202,7 @@ class KMeansBridge(nn.Module):
         mapped = vocab_center.to(dtype=ts_embeds.dtype) + direction * distance * self.residual_scale
         return mapped
 
-    # 将预测出的词表嵌入反向映射回时序嵌入空间。
+    # Map vocab embeds back to time-series space.
     def map_vocab_to_ts_space(self, vocab_embeds):
         if not self.ready:
             return vocab_embeds
@@ -221,7 +221,7 @@ class KMeansBridge(nn.Module):
 class GPT2TS(nn.Module):
     """Patch-cluster GPT2 forecaster with LoRA-tuned attention."""
 
-    # 初始化 GPT2TS 主模型、共享线性投影、聚类桥、LoRA 和 patch 解码器。
+    # Initialize GPT2TS modules.
     def __init__(self, configs):
         super().__init__()
         self.configs = configs
@@ -256,7 +256,7 @@ class GPT2TS(nn.Module):
         )
         
         # kmeans bridge
-        cluster_seed = configs.cluster_seed
+        cluster_seed = getattr(configs, "cluster_seed", 0)
         self.bridge = KMeansBridge(
             num_clusters=getattr(configs, "num_clusters", 64),
             embed_dim=self.gpt_dim,
@@ -281,7 +281,7 @@ class GPT2TS(nn.Module):
         )
         self.output_dropout = nn.Dropout(float(getattr(configs, "dropout", 0.05)))
 
-    # 根据配置加载预训练 GPT-2 或随机初始化 GPT-2。
+    # Load pretrained or fresh GPT-2.
     def _load_gpt2(self, config):  
         if getattr(self.configs, "use_pretrained_gpt2", False):
             return AutoModelForCausalLM.from_pretrained(
@@ -291,12 +291,12 @@ class GPT2TS(nn.Module):
             )
         return AutoModelForCausalLM.from_config(config)
 
-    # 冻结 GPT-2 原始参数，只保留外接模块或 LoRA 可训练。
+    # Freeze base GPT-2 params.
     def _freeze_gpt2(self):
         for param in self.gpt2.parameters():
             param.requires_grad = False
 
-    # 将 LoRA 适配器注入 GPT-2 attention 投影层。
+    # Inject LoRA into attention projections.
     def _inject_lora(self):
         r = int(getattr(self.configs, "lora_r", 8))
         if r <= 0:
@@ -312,11 +312,11 @@ class GPT2TS(nn.Module):
             if "c_proj" in targets:
                 block.attn.c_proj = LoRAConv1D(block.attn.c_proj, r=r, alpha=alpha, dropout=dropout)
 
-    # 获取 GPT-2 输入词表 embedding 权重。
+    # Get GPT input embeddings.
     def _vocab_weight(self):
         return self.gpt2.get_input_embeddings().weight.detach()
 
-    # 在模型初始化时筛选 GPT 词表 embedding 并拟合词表聚类中心。
+    # Fit vocab clusters at init.
     @torch.no_grad()
     def _fit_vocab_clusters(self):
         num_clusters = int(getattr(self.configs, "num_clusters", 64))
@@ -332,7 +332,7 @@ class GPT2TS(nn.Module):
             return
         self.bridge.fit_ts_to_vocab(history_ts_embeds.detach())
 
-    # 将 GPT 输出 logits 转换为预测 token id 和对应词表 embedding。
+    # Convert logits to predicted vocab embeddings.
     def _predicted_vocab_embeddings(self, logits):
         temperature = max(float(getattr(self.configs, "forecast_temperature", 1.0)), 1e-6)
         top_k = int(getattr(self.configs, "forecast_top_k", 64))
@@ -351,7 +351,7 @@ class GPT2TS(nn.Module):
         token_ids = probs.argmax(dim=-1)
         return embeds, token_ids
 
-    # 执行时序预测主流程，从历史序列生成未来预测序列。
+    # Forecast future values.
     def forecast(self, batch_x):
         history_patches = self.patch_tokenizer.patchify(batch_x)
         history_ts_embeds = self.patch_tokenizer.encode(history_patches)
@@ -382,7 +382,7 @@ class GPT2TS(nn.Module):
         )
         return pred, aux
 
-    # 模型前向接口，返回预测、可选损失和辅助信息。
+    # Return prediction, optional loss, and aux data.
     def forward(self, batch_x, batch_y=None):
         pred, aux = self.forecast(batch_x)
         loss = None

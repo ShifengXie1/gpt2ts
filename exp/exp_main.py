@@ -14,9 +14,9 @@ from utils.tools import EarlyStopping, adjust_learning_rate
 
 
 class Exp_Main(Exp_Basic):
-    # 初始化实验入口，创建设备、模型和结果目录。
+    # Initialize experiment state.
     def __init__(self, args):
-        super(Exp_Main, self).__init__(args) # 调用父类构造函数
+        super(Exp_Main, self).__init__(args)
 
         self.results_dir = args.results_dir if args.results_dir else "./results"
         os.makedirs(self.results_dir, exist_ok=True)
@@ -27,21 +27,21 @@ class Exp_Main(Exp_Basic):
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.amp_enabled = bool(self.args.use_amp and self.device.type == "cuda")
 
-    # 构建 GPT2TS 模型实例。
+    # Build the GPT2TS model.
     def _build_model(self):
         return gpt2ts.GPT2TS(self.args).float()
 
-    # 根据数据划分标记加载数据集和 DataLoader。
+    # Load a split and DataLoader.
     def _get_data(self, flag):
         data_set, data_loader = data_provider(self.args, flag)
         return data_set, data_loader
 
-    # 选择优化器并只优化可训练参数。
+    # Optimize trainable params only.
     def _select_optimizer(self):
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         return optim.Adam(trainable_params, lr=self.args.learning_rate, weight_decay=self.args.weight_decay)
 
-    # 根据参数选择训练损失函数。
+    # Select the training loss.
     def _select_criterion(self):
         criterions = {"mse": torch.nn.MSELoss(), "smoothL1": torch.nn.SmoothL1Loss()}
         try:
@@ -49,7 +49,18 @@ class Exp_Main(Exp_Basic):
         except KeyError as exc:
             raise ValueError(f"Invalid loss: {self.args.loss}") from exc
 
-    # 处理一个 batch，完成设备迁移、前向传播和真实值切片。
+    # Align prediction horizon and channels.
+    def _align_prediction_and_target(self, pred, target):
+        pred = pred[:, -self.args.pred_len :, :]
+        target = target[:, -self.args.pred_len :, :]
+        if self.args.features == "MS":
+            c_out = int(getattr(self.args, "c_out", target.shape[-1]) or target.shape[-1])
+            if c_out > 0:
+                pred = pred[:, :, -c_out:]
+                target = target[:, :, -c_out:]
+        return pred, target
+
+    # Process one batch.
     def _process_one_batch(self, batch):
         if len(batch) < 2:
             raise ValueError("Expected a batch containing at least input and target tensors.")
@@ -60,13 +71,14 @@ class Exp_Main(Exp_Basic):
         
         if self.amp_enabled:
             with torch.amp.autocast(device_type=self.device.type, enabled=self.amp_enabled):
-                output = self.model(batch_x) # 前向传播
+                output = self.model(batch_x)
         else:
             output = self.model(batch_x) 
         pred = output.pred if hasattr(output, "pred") else output
+        pred, target = self._align_prediction_and_target(pred, target)
         return pred, target
 
-    # 在验证集或测试集上评估模型并返回 MSE 和 MAE。
+    # Evaluate a split.
     def vali(self, vali_data, vali_loader, criterion):
         self.model.eval()
         preds, trues = [], []
@@ -86,7 +98,7 @@ class Exp_Main(Exp_Basic):
             self.model.train()
             return mse, mae
 
-    # 执行完整训练流程，包括聚类拟合、训练循环、验证和早停。
+    # Run training and early stopping.
     def train(self, setting):
         train_data, train_loader = self._get_data(flag="train")
         vali_data, vali_loader = self._get_data(flag="val")
@@ -153,7 +165,7 @@ class Exp_Main(Exp_Basic):
         self.model.load_state_dict(torch.load(best_model_path, map_location=self.device))
         return self.model
 
-    # 在测试集上推理、计算指标并保存预测结果。
+    # Test and save results.
     def test(self, setting):
         test_data, test_loader = self._get_data(flag="test")
         criterion = self._select_criterion()
