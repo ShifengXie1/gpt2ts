@@ -36,8 +36,6 @@ def build_args():
     parser.add_argument('--cluster_residual_scale', type=float, default=1.0, help='scale for distance-preserving cluster residuals')
     parser.add_argument('--cluster_normalize', type=bool, default=True, help='normalize embeddings when assigning clusters')
     parser.add_argument('--cluster_seed', type=int, default=None, help='seed for cluster init and random center mapping')
-    parser.add_argument('--history_lookup_temperature', type=float, default=0.2, help='temperature for mapping predicted embeddings to history patches')
-    parser.add_argument('--hard_patch_lookup', action='store_true', default=False, help='use nearest historical patch at evaluation time')
     parser.add_argument('--forecast_temperature', type=float, default=1.0, help='temperature for token embedding prediction')
     parser.add_argument('--forecast_top_k', type=int, default=64, help='use top-k token embeddings for differentiable predicted embedding')
     parser.add_argument('--lora_r', type=int, default=8, help='LoRA rank for GPT-2 attention projections')

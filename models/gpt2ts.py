@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoConfig, AutoModelForCausalLM
 
-from models.patchdecoder import HistoryPatchDecoder
+from models.patchdecoder import OverlapAddPatchDecoder
 from models.patchtokenizer import PatchTokenizer
 
 
@@ -221,7 +221,7 @@ class KMeansBridge(nn.Module):
 class GPT2TS(nn.Module):
     """Patch-cluster GPT2 forecaster with LoRA-tuned attention."""
 
-    # 初始化 GPT2TS 主模型、聚类桥、LoRA 和历史 patch 解码器。
+    # 初始化 GPT2TS 主模型、共享线性投影、聚类桥、LoRA 和 patch 解码器。
     def __init__(self, configs):
         super().__init__()
         self.configs = configs
@@ -270,16 +270,14 @@ class GPT2TS(nn.Module):
             self.future_patch_count = 1
         else:
             self.future_patch_count = math.ceil((self.pred_len - self.patch_len) / self.stride) + 1
-        self.future_queries = nn.Parameter(torch.empty(self.future_patch_count, self.gpt_dim))
-        nn.init.normal_(self.future_queries, mean=0.0, std=self.gpt_dim ** -0.5)
+        self.future_query = nn.Parameter(torch.empty(1, self.gpt_dim))
+        nn.init.normal_(self.future_query, mean=0.0, std=self.gpt_dim ** -0.5)
 
         # decoder
-        self.decoder = HistoryPatchDecoder(
+        self.decoder = OverlapAddPatchDecoder(
             patch_len=self.patch_len,
             stride=self.stride,
             pred_len=self.pred_len,
-            temperature=getattr(configs, "history_lookup_temperature", 0.2),
-            hard_lookup=getattr(configs, "hard_patch_lookup", False),
         )
         self.output_dropout = nn.Dropout(float(getattr(configs, "dropout", 0.05)))
 
@@ -361,7 +359,7 @@ class GPT2TS(nn.Module):
         history_llm_embeds = self.bridge.map_ts_to_vocab_space(history_ts_embeds)
         history_llm_embeds = self.output_dropout(history_llm_embeds)
 
-        future_queries = self.future_queries.unsqueeze(0).expand(batch_x.shape[0], -1, -1)
+        future_queries = self.future_query.unsqueeze(0).expand(batch_x.shape[0], self.future_patch_count, -1)
         inputs_embeds = torch.cat([history_llm_embeds, future_queries], dim=1)
         attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=batch_x.device)
 
@@ -370,12 +368,14 @@ class GPT2TS(nn.Module):
         pred_vocab_embeds, pred_token_ids = self._predicted_vocab_embeddings(future_logits)
         pred_ts_embeds = self.bridge.map_vocab_to_ts_space(pred_vocab_embeds)
 
-        pred = self.decoder(pred_ts_embeds, history_ts_embeds, history_patches)
+        pred_patches = self.patch_tokenizer.decode(pred_ts_embeds)
+        pred = self.decoder(pred_patches)
         pred = pred[:, : self.pred_len, :]
         aux = SimpleNamespace(
             pred_token_ids=pred_token_ids,
             pred_vocab_embeds=pred_vocab_embeds,
             pred_ts_embeds=pred_ts_embeds,
+            pred_patches=pred_patches,
             history_llm_embeds=history_llm_embeds,
             history_ts_embeds=history_ts_embeds,
             mapped_ts_embeds=pred_ts_embeds,
