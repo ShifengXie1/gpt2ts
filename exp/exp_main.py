@@ -25,10 +25,11 @@ class Exp_Main(Exp_Basic):
         self.min_test_mae = float("inf")
         self.epoch_for_min_test_loss = -1
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.amp_enabled = bool(self.args.use_amp and self.device.type == "cuda")
 
     # 构建 GPT2TS 模型实例。
     def _build_model(self):
-        return gpt2ts.Model(self.args).float()
+        return gpt2ts.GPT2TS(self.args).float()
 
     # 根据数据划分标记加载数据集和 DataLoader。
     def _get_data(self, flag):
@@ -57,11 +58,12 @@ class Exp_Main(Exp_Basic):
         batch_x = batch_x.to(dtype=torch.float, device=self.device)
         target = target.to(dtype=torch.float, device=self.device)
         
-        if self.args.use_amp:
-            with torch.amp.autocast():
-                pred = self.model(batch_x) # 前向传播
+        if self.amp_enabled:
+            with torch.amp.autocast(device_type=self.device.type, enabled=self.amp_enabled):
+                output = self.model(batch_x) # 前向传播
         else:
-            pred = self.model(batch_x) 
+            output = self.model(batch_x) 
+        pred = output.pred if hasattr(output, "pred") else output
         return pred, target
 
     # 在验证集或测试集上评估模型并返回 MSE 和 MAE。
@@ -98,8 +100,8 @@ class Exp_Main(Exp_Basic):
         model_optim = self._select_optimizer()
         criterion = self._select_criterion()
 
-        amp_enabled = bool(self.args.use_amp and self.device.type == "cuda")
-        scaler = torch.amp.GradScaler(enabled=amp_enabled)
+        
+        scaler = torch.amp.GradScaler(enabled=self.amp_enabled)
 
         for epoch in range(self.args.train_epochs):
             train_loss = []
@@ -111,7 +113,7 @@ class Exp_Main(Exp_Basic):
                 pred, true = self._process_one_batch(batch)
                 loss = criterion(pred, true)
 
-                if amp_enabled:
+                if self.amp_enabled:
                     scaler.scale(loss).backward()
                     scaler.step(model_optim)
                     scaler.update()
@@ -189,7 +191,7 @@ class Exp_Main(Exp_Basic):
         }
         
         result_path = os.path.join(self.results_dir, "result.txt")
-        with open(result_path, "w", encoding="utf-8") as file:
+        with open(result_path, "a", encoding="utf-8") as file:
             file.write(f"saved_at: {self.timestamp}\n")
             file.write(f"setting: {setting}\n")
             file.write(f"features: {self.args.features}\n")
@@ -198,5 +200,6 @@ class Exp_Main(Exp_Basic):
                 "test_loss={test_loss:.6f} | mse={mse:.6f}, mae={mae:.6f}, "
                 "rmse={rmse:.6f}, mape={mape:.6f}, mspe={mspe:.6f}\n".format(**metrics)
             )
+            file.write(f"\n")
             
         return mse, mae
