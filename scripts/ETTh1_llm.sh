@@ -19,6 +19,8 @@ PATCH_SIZE=8
 STRIDE=8
 N_LAYERS=0
 CLUSTER_NUM=128
+PATCH_LEVEL_NORMALIZE=True
+PATCH_NORM_EPS=1e-5
 TOKEN_TRAIN_STRIDE=1
 LORA_R=8
 LORA_ALPHA=16
@@ -41,6 +43,8 @@ for pred_len in "${PRED_LENS[@]}"; do
         --stride "$STRIDE" \
         --n_layers "$N_LAYERS" \
         --cluster_num "$CLUSTER_NUM" \
+        --patch_level_normalize "$PATCH_LEVEL_NORMALIZE" \
+        --patch_norm_eps "$PATCH_NORM_EPS" \
         --token_train_stride "$TOKEN_TRAIN_STRIDE" \
         --lora_r "$LORA_R" \
         --lora_alpha "$LORA_ALPHA" \
