@@ -254,10 +254,47 @@ class PatchTokenDictionary(nn.Module):
         if not self.ready:
             raise RuntimeError("PatchTokenDictionary must be fitted before converting patches to tokens.")
         flat = patches.reshape(-1, self.patch_len * self.c_in).float()
+        query_cluster_ids, _ = self._assign_to_centers(flat, self.patch_centers)
+        selected_indices = torch.empty(flat.shape[0], dtype=torch.long, device=flat.device)
+        selected_distances = torch.empty(flat.shape[0], dtype=flat.dtype, device=flat.device)
+        non_empty_clusters = torch.nonzero(
+            torch.bincount(self.patch_cluster_ids, minlength=self.cluster_num) > 0,
+            as_tuple=False,
+        ).flatten()
+        if non_empty_clusters.numel() == 0:
+            raise RuntimeError("No train patch cluster has assigned patches.")
+
         train_flat = self.train_patches.reshape(self.train_patches.shape[0], -1).float()
-        distances = torch.cdist(flat, train_flat)
-        nearest_indices = distances.argmin(dim=-1)
-        nearest_distances = distances.gather(1, nearest_indices.unsqueeze(-1)).squeeze(-1)
+        chunk_size = max(int(getattr(self, "nearest_chunk_size", 1024)), 1)
+
+        for cluster_id in torch.unique(query_cluster_ids):
+            query_indices = torch.nonzero(query_cluster_ids == cluster_id, as_tuple=False).flatten()
+            candidate_indices = torch.nonzero(self.patch_cluster_ids == cluster_id, as_tuple=False).flatten()
+
+            if candidate_indices.numel() == 0:
+                center = self.patch_centers[cluster_id].unsqueeze(0)
+                candidate_centers = self.patch_centers[non_empty_clusters]
+                fallback_pos = torch.cdist(
+                    self._distance_source(center.float()),
+                    self._distance_source(candidate_centers.float()),
+                ).argmin(dim=-1)
+                fallback_cluster_id = non_empty_clusters[fallback_pos].item()
+                candidate_indices = torch.nonzero(
+                    self.patch_cluster_ids == fallback_cluster_id,
+                    as_tuple=False,
+                ).flatten()
+
+            candidate_flat = train_flat[candidate_indices]
+            for start in range(0, query_indices.numel(), chunk_size):
+                end = min(start + chunk_size, query_indices.numel())
+                query_chunk_indices = query_indices[start:end]
+                distances = torch.cdist(flat[query_chunk_indices], candidate_flat)
+                local_indices = distances.argmin(dim=-1)
+                selected_indices[query_chunk_indices] = candidate_indices[local_indices]
+                selected_distances[query_chunk_indices] = distances.gather(1, local_indices.unsqueeze(-1)).squeeze(-1)
+
+        nearest_indices = selected_indices
+        nearest_distances = selected_distances
         self.last_exact_match_count = int((nearest_distances <= self.match_tol).sum().item())
         self.last_total_match_count = int(flat.shape[0])
         token_ids = self.train_patch_token_ids[nearest_indices]
