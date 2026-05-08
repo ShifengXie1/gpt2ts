@@ -492,22 +492,13 @@ class GPT2TS(nn.Module):
         eos_token_id = self.gpt2.config.eos_token_id
         pad_token_id = eos_token_id if eos_token_id is not None else 0
         attention_mask = torch.ones_like(history_token_ids)
-        top_k = int(getattr(self.configs, "forecast_top_k", 1))
-        temperature = max(float(getattr(self.configs, "forecast_temperature", 1.0)), 1e-6)
-        do_sample = top_k > 1 or abs(temperature - 1.0) > 1e-6
-        generate_kwargs = {}
-        if do_sample:
-            generate_kwargs["temperature"] = temperature
-            if top_k > 0:
-                generate_kwargs["top_k"] = top_k
         generated = self.gpt2.generate(
             input_ids=history_token_ids,
             attention_mask=attention_mask,
             max_new_tokens=self.future_patch_count,
-            do_sample=do_sample,
+            do_sample=False,
             eos_token_id=None,
             pad_token_id=pad_token_id,
-            **generate_kwargs,
         )
         return generated[:, -self.future_patch_count :]
 

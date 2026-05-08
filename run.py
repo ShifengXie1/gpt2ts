@@ -36,8 +36,6 @@ def build_args():
     parser.add_argument('--cluster_seed', type=int, default=None, help='seed for cluster init and random center mapping')
     parser.add_argument('--patch_match_tol', type=float, default=1e-6, help='tolerance for exact patch lookup before nearest-neighbor fallback')
     parser.add_argument('--token_train_stride', type=int, default=1, help='stride over train patch-token windows for GPT/LoRA training')
-    parser.add_argument('--forecast_temperature', type=float, default=1.0, help='sampling temperature for GPT token generation')
-    parser.add_argument('--forecast_top_k', type=int, default=1, help='top-k sampling for GPT token generation; 1 uses greedy decoding')
     parser.add_argument('--lora_r', type=int, default=8, help='LoRA rank for GPT-2 attention projections')
     parser.add_argument('--lora_alpha', type=float, default=16.0, help='LoRA alpha')
     parser.add_argument('--lora_dropout', type=float, default=0.05, help='LoRA dropout')

@@ -20,7 +20,6 @@ STRIDE=8
 N_LAYERS=0
 CLUSTER_NUM=128
 TOKEN_TRAIN_STRIDE=1
-FORECAST_TOP_K=1
 LORA_R=8
 LORA_ALPHA=16
 LORA_DROPOUT=0.05
@@ -43,7 +42,6 @@ for pred_len in "${PRED_LENS[@]}"; do
         --n_layers "$N_LAYERS" \
         --cluster_num "$CLUSTER_NUM" \
         --token_train_stride "$TOKEN_TRAIN_STRIDE" \
-        --forecast_top_k "$FORECAST_TOP_K" \
         --lora_r "$LORA_R" \
         --lora_alpha "$LORA_ALPHA" \
         --lora_dropout "$LORA_DROPOUT" \
