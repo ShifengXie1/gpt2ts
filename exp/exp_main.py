@@ -82,7 +82,7 @@ class Exp_Main(Exp_Basic):
         return pred, target
 
     # Evaluate a split.
-    def vali(self, vali_data, vali_loader, criterion):
+    def vali(self, vali_loader):
         self.model.eval()
         preds, trues = [], []
 
@@ -103,9 +103,9 @@ class Exp_Main(Exp_Basic):
 
     # Run training and early stopping.
     def train(self, setting):
-        train_data, train_loader = self._get_data(flag="train")
-        vali_data, vali_loader = self._get_data(flag="val")
-        test_data, test_loader = self._get_data(flag="test")
+        _, train_loader = self._get_data(flag="train")
+        _, vali_loader = self._get_data(flag="val")
+        _, test_loader = self._get_data(flag="test")
 
         checkpoint_dir = os.path.join(self.results_dir, setting, self.timestamp, "checkpoints")
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -141,8 +141,8 @@ class Exp_Main(Exp_Basic):
                 train_loss.append(loss.detach().item())
 
             train_loss = float(np.mean(train_loss)) if train_loss else float("nan")
-            vali_loss, vali_mae = self.vali(vali_data, vali_loader, criterion)
-            test_loss, test_mae = self.vali(test_data, test_loader, criterion)
+            vali_loss, vali_mae = self.vali(vali_loader)
+            test_loss, test_mae = self.vali(test_loader)
 
             if test_loss < self.min_test_loss:
                 self.min_test_loss = test_loss
@@ -209,7 +209,7 @@ class Exp_Main(Exp_Basic):
         plt.close(fig)
 
     def test(self, setting):
-        test_data, test_loader = self._get_data(flag="test")
+        _, test_loader = self._get_data(flag="test")
         criterion = self._select_criterion()
         self.model.eval()
         preds, trues = [], []
@@ -255,7 +255,6 @@ class Exp_Main(Exp_Basic):
             file.write(f"saved_at: {self.timestamp}\n")
             file.write(f"setting: {setting}\n")
             file.write(f"features: {self.args.features}\n")
-            file.write(f"target_col: {self.args.target_col}\n")
             file.write(
                 "test_loss={test_loss:.6f} | mse={mse:.6f}, mae={mae:.6f}, "
                 "rmse={rmse:.6f}, mape={mape:.6f}, mspe={mspe:.6f}\n".format(**metrics)

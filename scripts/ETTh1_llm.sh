@@ -17,7 +17,6 @@ BATCH_SIZE=8
 PATCH_SIZE=8
 STRIDE=8
 N_LAYERS=0
-NUM_CLUSTERS=64
 FORECAST_TOP_K=1
 AUX_TOKEN_LOSS_WEIGHT=1
 AUX_EMBED_LOSS_WEIGHT=1
@@ -40,7 +39,6 @@ for pred_len in "${PRED_LENS[@]}"; do
         --patch_len "$PATCH_SIZE" \
         --stride "$STRIDE" \
         --n_layers "$N_LAYERS" \
-        --num_clusters "$NUM_CLUSTERS" \
         --forecast_top_k "$FORECAST_TOP_K" \
         --aux_token_loss_weight "$AUX_TOKEN_LOSS_WEIGHT" \
         --aux_embed_loss_weight "$AUX_EMBED_LOSS_WEIGHT" \

@@ -13,7 +13,6 @@ def build_args():
     # Model
     parser.add_argument('--model', type = str, required = False, choices = ['gpt2ts'], default = 'gpt2ts', help = 'model of experiment')
     parser.add_argument('--task_name', type = str, required = False, choices = ['long_term_forecast'], default = 'long_term_forecast')
-    parser.add_argument('--is_training', type=int, default=1, help='kept for script compatibility')
     
     # Model params
     parser.add_argument('--seq_len', type = int, default = 512, help = 'length of the look back window')
@@ -31,8 +30,6 @@ def build_args():
     parser.add_argument('--loss', type=str, default='mse', choices=['mse', 'smoothL1'])
     parser.add_argument('--lradj', type=str, default='none', help='learning-rate adjustment policy')
     parser.add_argument('--n_layers', type=int, default=0, help='number of GPT-2 layers to keep; 0 keeps all layers')
-    parser.add_argument('--num_clusters', type=int, default=64, help='number of clusters for GPT vocab embeddings')
-    parser.add_argument('--cluster_residual_scale', type=float, default=1.0, help='scale for distance-preserving cluster residuals')
     parser.add_argument('--cluster_normalize', type=bool, default=True, help='normalize embeddings when assigning clusters')
     parser.add_argument('--cluster_seed', type=int, default=None, help='seed for cluster init and random center mapping')
     parser.add_argument('--forecast_temperature', type=float, default=1.0, help='temperature for token embedding prediction')
@@ -41,14 +38,6 @@ def build_args():
     parser.add_argument('--aux_embed_loss_weight', type=float, default=0.0, help='weight for future-embedding auxiliary alignment')
     parser.add_argument('--aux_temperature', type=float, default=1.0, help='temperature for auxiliary soft embedding loss')
     parser.add_argument('--aux_embed_top_k', type=int, default=64, help='top-k vocab embeddings used by auxiliary embedding loss')
-    parser.add_argument('--retrieval_temperature', type=float, default=1.0, help='temperature for key-value memory retrieval')
-    parser.add_argument(
-        '--retrieval_mode',
-        type=str,
-        default='straight_through',
-        choices=['soft', 'hard', 'straight_through'],
-        help='memory retrieval mode for predicted patches',
-    )
     parser.add_argument('--lora_r', type=int, default=8, help='LoRA rank for GPT-2 attention projections')
     parser.add_argument('--lora_alpha', type=float, default=16.0, help='LoRA alpha')
     parser.add_argument('--lora_dropout', type=float, default=0.05, help='LoRA dropout')
@@ -73,7 +62,6 @@ def build_args():
     parser.add_argument("--data_path", type=str, default=None)
     parser.add_argument("--root_path", type=str, default=None)
     parser.add_argument("--target", type=str, default=None)
-    parser.add_argument("--target_col", type=str, default=None)
     parser.add_argument("--c_in", type=int, default=None)
     parser.add_argument("--c_out", type=int, default=None)
     parser.add_argument("--embed", type=str, default="timeF", help="time feature encoding type")
@@ -89,9 +77,7 @@ def build_args():
     args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
     if args.use_gpu and args.use_multi_gpu:
         args.devices = args.devices.replace(' ','')
-        device_ids = args.devices.split(',')
-        args.device_ids = [int(id_) for id_ in device_ids]
-        args.gpu = args.device_ids[0]
+        args.gpu = int(args.devices.split(',')[0])
 
     
     # Dataset presets
@@ -113,9 +99,7 @@ def build_args():
         args.freq = data_info['freq']
         args.c_in = data_info[args.features][0]
         args.c_out = data_info[args.features][1]
-        if args.target_col is None:
-            args.target_col = args.target
-    
+
     return args
 
 def build_results_dir(args):
@@ -139,7 +123,7 @@ def main():
     exp.train(setting)
         
     print('Start Testing- {}'.format(setting))
-    loss_mse, loss_mae = exp.test(setting)
+    exp.test(setting)
 
 
 if __name__ == "__main__":

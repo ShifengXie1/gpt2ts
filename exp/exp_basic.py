@@ -1,6 +1,5 @@
 import os
 
-import numpy as np
 import torch
 
 
@@ -13,7 +12,6 @@ class Exp_Basic(object):
 
     def _build_model(self):
         raise NotImplementedError
-        return None
 
     # Select CPU or GPU.
     def _acquire_device(self):
