@@ -14,12 +14,14 @@ TRAIN_EPOCHS=10
 PATIENCE=3
 SEQ_LEN=720
 BATCH_SIZE=8
+TOKEN_BATCH_SIZE=8
 PATCH_SIZE=8
 STRIDE=8
 N_LAYERS=0
 CLUSTER_NUM=128
+TOKEN_TRAIN_STRIDE=1
 FORECAST_TOP_K=1
-LORA_R=0
+LORA_R=8
 LORA_ALPHA=16
 LORA_DROPOUT=0.05
 
@@ -31,6 +33,7 @@ for pred_len in "${PRED_LENS[@]}"; do
         --seq_len "$SEQ_LEN" \
         --pred_len "$pred_len" \
         --batch_size "$BATCH_SIZE" \
+        --token_batch_size "$TOKEN_BATCH_SIZE" \
         --learning_rate "$LEARNING_RATE" \
         --train_epochs "$TRAIN_EPOCHS" \
         --patience "$PATIENCE" \
@@ -39,6 +42,7 @@ for pred_len in "${PRED_LENS[@]}"; do
         --stride "$STRIDE" \
         --n_layers "$N_LAYERS" \
         --cluster_num "$CLUSTER_NUM" \
+        --token_train_stride "$TOKEN_TRAIN_STRIDE" \
         --forecast_top_k "$FORECAST_TOP_K" \
         --lora_r "$LORA_R" \
         --lora_alpha "$LORA_ALPHA" \

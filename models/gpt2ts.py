@@ -398,6 +398,41 @@ class GPT2TS(nn.Module):
     def save_patch_token_map(self, path):
         self.dictionary.save_npz(path)
 
+    @torch.no_grad()
+    def build_lm_training_tensors(self):
+        if not self.dictionary.ready:
+            raise RuntimeError("Call fit_patch_token_map before building token LM training data.")
+
+        tokens = self.dictionary.train_patch_token_ids.detach().long()
+        window_size = self.history_patch_count + self.future_patch_count
+        if tokens.numel() < window_size:
+            raise ValueError(
+                f"Training token sequence has {tokens.numel()} patches, but at least {window_size} are required."
+            )
+
+        max_positions = int(getattr(self.gpt2.config, "n_positions", window_size))
+        if window_size - 1 > max_positions:
+            raise ValueError(
+                f"Token training window length {window_size - 1} exceeds GPT context length {max_positions}."
+            )
+
+        step = max(int(getattr(self.configs, "token_train_stride", 1)), 1)
+        windows = tokens.unfold(dimension=0, size=window_size, step=step).contiguous()
+        input_ids = windows[:, :-1].contiguous()
+        labels = windows[:, 1:].contiguous()
+        labels[:, : self.history_patch_count - 1] = -100
+        return input_ids, labels
+
+    def token_lm_loss(self, input_ids, labels):
+        attention_mask = torch.ones_like(input_ids)
+        outputs = self.gpt2(input_ids=input_ids, attention_mask=attention_mask)
+        logits = outputs.logits
+        return F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]).float(),
+            labels.reshape(-1),
+            ignore_index=-100,
+        )
+
     def _patchify_batch(self, batch_x):
         if batch_x.shape[1] != self.seq_len:
             raise ValueError(f"Expected batch_x length {self.seq_len}, got {batch_x.shape[1]}.")
@@ -420,12 +455,22 @@ class GPT2TS(nn.Module):
         eos_token_id = self.gpt2.config.eos_token_id
         pad_token_id = eos_token_id if eos_token_id is not None else 0
         attention_mask = torch.ones_like(history_token_ids)
+        top_k = int(getattr(self.configs, "forecast_top_k", 1))
+        temperature = max(float(getattr(self.configs, "forecast_temperature", 1.0)), 1e-6)
+        do_sample = top_k > 1 or abs(temperature - 1.0) > 1e-6
+        generate_kwargs = {}
+        if do_sample:
+            generate_kwargs["temperature"] = temperature
+            if top_k > 0:
+                generate_kwargs["top_k"] = top_k
         generated = self.gpt2.generate(
             input_ids=history_token_ids,
             attention_mask=attention_mask,
             max_new_tokens=self.future_patch_count,
-            do_sample=False,
+            do_sample=do_sample,
+            eos_token_id=None,
             pad_token_id=pad_token_id,
+            **generate_kwargs,
         )
         return generated[:, -self.future_patch_count :]
 

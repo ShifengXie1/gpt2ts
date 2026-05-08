@@ -5,6 +5,7 @@ from datetime import datetime
 import numpy as np
 import torch
 from torch import optim
+from torch.utils.data import DataLoader, TensorDataset
 
 from exp.exp_basic import Exp_Basic
 from data_provider.data_factory import data_provider
@@ -101,6 +102,97 @@ class Exp_Main(Exp_Basic):
             self.model.train()
             return mse, mae
 
+    def _train_patch_token_lm(self, checkpoint_dir, vali_loader, test_loader):
+        if not hasattr(self.model, "build_lm_training_tensors"):
+            return False
+
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        if not trainable_params:
+            print("\tSkipping token LM training: no trainable parameters. Set --lora_r > 0 to enable LoRA.")
+            torch.save(self.model.state_dict(), os.path.join(checkpoint_dir, "checkpoint.pth"))
+            return False
+        if int(self.args.train_epochs) <= 0:
+            print("\tSkipping token LM training: train_epochs <= 0.")
+            torch.save(self.model.state_dict(), os.path.join(checkpoint_dir, "checkpoint.pth"))
+            return False
+
+        input_ids, labels = self.model.build_lm_training_tensors()
+        dataset = TensorDataset(input_ids.detach().cpu(), labels.detach().cpu())
+        token_batch_size = int(getattr(self.args, "token_batch_size", self.args.batch_size) or self.args.batch_size)
+        token_loader = DataLoader(
+            dataset,
+            batch_size=max(token_batch_size, 1),
+            shuffle=True,
+            num_workers=self.args.num_workers,
+            drop_last=False,
+        )
+
+        model_optim = optim.Adam(trainable_params, lr=self.args.learning_rate, weight_decay=self.args.weight_decay)
+        early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
+        scaler = torch.amp.GradScaler(enabled=self.amp_enabled)
+
+        print(
+            "\tToken LM training windows: {0} | input tokens: {1} | future labels/window: {2}".format(
+                len(dataset),
+                input_ids.shape[1],
+                self.model.future_patch_count,
+            )
+        )
+
+        for epoch in range(self.args.train_epochs):
+            token_losses = []
+            self.model.train()
+            epoch_time = time.time()
+
+            for batch_input_ids, batch_labels in token_loader:
+                batch_input_ids = batch_input_ids.to(device=self.device, dtype=torch.long)
+                batch_labels = batch_labels.to(device=self.device, dtype=torch.long)
+
+                model_optim.zero_grad(set_to_none=True)
+                if self.amp_enabled:
+                    with torch.amp.autocast(device_type=self.device.type, enabled=self.amp_enabled):
+                        loss = self.model.token_lm_loss(batch_input_ids, batch_labels)
+                    scaler.scale(loss).backward()
+                    scaler.step(model_optim)
+                    scaler.update()
+                else:
+                    loss = self.model.token_lm_loss(batch_input_ids, batch_labels)
+                    loss.backward()
+                    model_optim.step()
+
+                token_losses.append(loss.detach().item())
+
+            train_loss = float(np.mean(token_losses)) if token_losses else float("nan")
+            vali_loss, vali_mae = self.vali(vali_loader)
+            test_loss, test_mae = self.vali(test_loader)
+
+            if test_loss < self.min_test_loss:
+                self.min_test_loss = test_loss
+                self.min_test_mae = test_mae
+                self.epoch_for_min_test_loss = epoch
+
+            print("Token Epoch {}: cost time: {:.2f} sec".format(epoch + 1, time.time() - epoch_time))
+            print(
+                "\tEpoch {0}: Steps- {1} | Token Loss: {2:.5f} Vali.MSE: {3:.5f} Vali.MAE: {4:.5f} Test.MSE: {5:.5f} Test.MAE: {6:.5f}".format(
+                    epoch + 1, len(token_loader), train_loss, vali_loss, vali_mae, test_loss, test_mae
+                )
+            )
+
+            early_stopping(vali_loss, self.model, checkpoint_dir)
+            if early_stopping.early_stop:
+                print("\tEarly stopping")
+                break
+            if np.isnan(train_loss):
+                print("\tStopping: token-loss-nan")
+                break
+
+            adjust_learning_rate(model_optim, None, epoch + 1, self.args)
+
+        best_model_path = os.path.join(checkpoint_dir, "checkpoint.pth")
+        if os.path.exists(best_model_path):
+            self.model.load_state_dict(torch.load(best_model_path, map_location=self.device))
+        return True
+
     # Run training and early stopping.
     def train(self, setting):
         train_data, train_loader = self._get_data(flag="train")
@@ -121,16 +213,20 @@ class Exp_Main(Exp_Basic):
             save_dir = os.path.join(self.results_dir, setting, self.timestamp)
             os.makedirs(save_dir, exist_ok=True)
             self.model.save_patch_token_map(os.path.join(save_dir, "patch_token_map.npz"))
-            torch.save(self.model.state_dict(), os.path.join(checkpoint_dir, "checkpoint.pth"))
+            trained_lm = self._train_patch_token_lm(checkpoint_dir, vali_loader, test_loader)
+            if not trained_lm:
+                torch.save(self.model.state_dict(), os.path.join(checkpoint_dir, "checkpoint.pth"))
 
             vali_loss, vali_mae = self.vali(vali_loader)
             test_loss, test_mae = self.vali(test_loader)
-            self.min_test_loss = test_loss
-            self.min_test_mae = test_mae
-            self.epoch_for_min_test_loss = 0
-            print("Patch-token map fitted in {:.2f} sec".format(time.time() - fit_start))
+            if test_loss < self.min_test_loss:
+                self.min_test_loss = test_loss
+                self.min_test_mae = test_mae
+                if self.epoch_for_min_test_loss < 0:
+                    self.epoch_for_min_test_loss = 0
+            print("Patch-token map fitted and token LM stage finished in {:.2f} sec".format(time.time() - fit_start))
             print(
-                "\tFit-only | Train patches: {0} | Vali.MSE: {1:.5f} Vali.MAE: {2:.5f} Test.MSE: {3:.5f} Test.MAE: {4:.5f}".format(
+                "\tPatch-token | Train patches: {0} | Vali.MSE: {1:.5f} Vali.MAE: {2:.5f} Test.MSE: {3:.5f} Test.MAE: {4:.5f}".format(
                     self.model.dictionary.train_patches.shape[0],
                     vali_loss,
                     vali_mae,
