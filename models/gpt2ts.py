@@ -914,7 +914,7 @@ class GPT2TS(nn.Module):
             history_z_embeds=history_z_embeds,
             history_vocab_center_ids=history_vocab_mapping.cluster_ids,
             history_selected_vocab_token_ids=history_vocab_mapping.selected_vocab_token_ids,
-            history_target_vocab_distances=history_vocab_mapping.target_vocab_distances,
+            history_target_vocab_distances=history_vocab_mapping.target_distances,
             history_selected_vocab_distances=history_vocab_mapping.selected_vocab_distances,
             history_selected_vocab_distance_errors=history_vocab_mapping.selected_distance_errors,
             history_used_vocab_cluster_fallback=history_vocab_mapping.used_vocab_cluster_fallback,
