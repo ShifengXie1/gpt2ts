@@ -538,17 +538,25 @@ class GPT2TS(nn.Module):
         if history_token_ids.shape[1] > max_history:
             history_token_ids = history_token_ids[:, -max_history:]
 
-        eos_token_id = self.gpt2.config.eos_token_id
-        pad_token_id = eos_token_id if eos_token_id is not None else 0
-        attention_mask = torch.ones_like(history_token_ids)
-        generated = self.gpt2.generate(
-            input_ids=history_token_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=self.future_patch_count,
-            do_sample=False,
-            eos_token_id=None,
-            pad_token_id=pad_token_id,
+        allowed_token_ids = torch.unique(self.dictionary.train_patch_token_ids.detach()).to(
+            device=history_token_ids.device,
+            dtype=torch.long,
         )
+        if allowed_token_ids.numel() == 0:
+            raise RuntimeError("No allowed training token ids are available for GPT generation.")
+
+        vocab_size = int(self.gpt2.config.vocab_size)
+        allowed_mask = torch.zeros(vocab_size, dtype=torch.bool, device=history_token_ids.device)
+        allowed_mask[allowed_token_ids.clamp(min=0, max=vocab_size - 1)] = True
+
+        generated = history_token_ids
+        for _ in range(self.future_patch_count):
+            attention_mask = torch.ones_like(generated)
+            outputs = self.gpt2(input_ids=generated, attention_mask=attention_mask)
+            next_logits = outputs.logits[:, -1, :]
+            next_logits = next_logits.masked_fill(~allowed_mask.unsqueeze(0), -torch.inf)
+            next_token_ids = next_logits.argmax(dim=-1, keepdim=True)
+            generated = torch.cat([generated, next_token_ids], dim=1)
         return generated[:, -self.future_patch_count :]
 
     @torch.no_grad()
