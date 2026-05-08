@@ -102,18 +102,40 @@ class Exp_Main(Exp_Basic):
             self.model.train()
             return mse, mae
 
+    def _save_model_checkpoint(self, checkpoint_path):
+        trainable_names = {name for name, param in self.model.named_parameters() if param.requires_grad}
+        full_state = self.model.state_dict()
+        trainable_state = {
+            name: tensor.detach().cpu()
+            for name, tensor in full_state.items()
+            if name in trainable_names
+        }
+        checkpoint = {
+            "model_state_dict": trainable_state,
+            "model_config": vars(self.args).copy(),
+            "trainable_param_names": sorted(trainable_names),
+        }
+        torch.save(checkpoint, checkpoint_path)
+
+    def _load_model_checkpoint(self, checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+        self.model.load_state_dict(state_dict, strict=False)
+
     def _train_patch_token_lm(self, checkpoint_dir, vali_loader, test_loader):
         if not hasattr(self.model, "build_lm_training_tensors"):
             return False
 
+        checkpoint_path = os.path.join(checkpoint_dir, "checkpoint.pth")
+
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         if not trainable_params:
             print("\tSkipping token LM training: no trainable parameters. Set --lora_r > 0 to enable LoRA.")
-            torch.save(self.model.state_dict(), os.path.join(checkpoint_dir, "checkpoint.pth"))
+            self._save_model_checkpoint(checkpoint_path)
             return False
         if int(self.args.train_epochs) <= 0:
             print("\tSkipping token LM training: train_epochs <= 0.")
-            torch.save(self.model.state_dict(), os.path.join(checkpoint_dir, "checkpoint.pth"))
+            self._save_model_checkpoint(checkpoint_path)
             return False
 
         input_ids, labels = self.model.build_lm_training_tensors()
@@ -128,8 +150,9 @@ class Exp_Main(Exp_Basic):
         )
 
         model_optim = optim.Adam(trainable_params, lr=self.args.learning_rate, weight_decay=self.args.weight_decay)
-        early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
         scaler = torch.amp.GradScaler(enabled=self.amp_enabled)
+        best_vali_loss = float("inf")
+        patience_counter = 0
 
         print(
             "\tToken LM training windows: {0} | input tokens: {1} | future labels/window: {2}".format(
@@ -178,19 +201,25 @@ class Exp_Main(Exp_Basic):
                 )
             )
 
-            early_stopping(vali_loss, self.model, checkpoint_dir)
-            if early_stopping.early_stop:
-                print("\tEarly stopping")
-                break
+            if vali_loss < best_vali_loss:
+                print(f"\tValidation loss decreased ({best_vali_loss:.6f} --> {vali_loss:.6f}).  Saving model ...")
+                best_vali_loss = vali_loss
+                patience_counter = 0
+                self._save_model_checkpoint(checkpoint_path)
+            else:
+                patience_counter += 1
+                print(f"\tEarlyStopping counter: {patience_counter} out of {self.args.patience}")
+                if patience_counter >= self.args.patience:
+                    print("\tEarly stopping")
+                    break
             if np.isnan(train_loss):
                 print("\tStopping: token-loss-nan")
                 break
 
             adjust_learning_rate(model_optim, None, epoch + 1, self.args)
 
-        best_model_path = os.path.join(checkpoint_dir, "checkpoint.pth")
-        if os.path.exists(best_model_path):
-            self.model.load_state_dict(torch.load(best_model_path, map_location=self.device))
+        if os.path.exists(checkpoint_path):
+            self._load_model_checkpoint(checkpoint_path)
         return True
 
     # Run training and early stopping.
@@ -213,9 +242,12 @@ class Exp_Main(Exp_Basic):
             save_dir = os.path.join(self.results_dir, setting, self.timestamp)
             os.makedirs(save_dir, exist_ok=True)
             self.model.save_patch_token_map(os.path.join(save_dir, "patch_token_map.npz"))
+            dropped_points = int(getattr(self.model.dictionary, "last_dropped_points", 0))
+            if dropped_points > 0:
+                print(f"\tPatchify drop_last: dropped {dropped_points} trailing training point(s).")
             trained_lm = self._train_patch_token_lm(checkpoint_dir, vali_loader, test_loader)
             if not trained_lm:
-                torch.save(self.model.state_dict(), os.path.join(checkpoint_dir, "checkpoint.pth"))
+                self._save_model_checkpoint(os.path.join(checkpoint_dir, "checkpoint.pth"))
 
             vali_loss, vali_mae = self.vali(vali_loader)
             test_loss, test_mae = self.vali(test_loader)
@@ -293,7 +325,7 @@ class Exp_Main(Exp_Basic):
             adjust_learning_rate(model_optim, None, epoch + 1, self.args)
 
         best_model_path = os.path.join(checkpoint_dir, "checkpoint.pth")
-        self.model.load_state_dict(torch.load(best_model_path, map_location=self.device))
+        self._load_model_checkpoint(best_model_path)
         return self.model
 
     # Test and save results.

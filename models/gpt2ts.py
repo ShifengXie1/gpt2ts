@@ -52,21 +52,22 @@ class PatchTokenDictionary(nn.Module):
         self.seed = 0 if seed is None else int(seed)
         self.match_tol = float(match_tol)
 
-        self.register_buffer("train_patches", torch.empty(0, self.patch_len, self.c_in), persistent=True)
-        self.register_buffer("train_patch_token_ids", torch.empty(0, dtype=torch.long), persistent=True)
-        self.register_buffer("patch_centers", torch.empty(self.cluster_num, self.patch_len * self.c_in), persistent=True)
-        self.register_buffer("patch_cluster_ids", torch.empty(0, dtype=torch.long), persistent=True)
-        self.register_buffer("patch_center_distances", torch.empty(0), persistent=True)
-        self.register_buffer("vocab_centers", torch.empty(0, 0), persistent=True)
-        self.register_buffer("vocab_token_cluster_ids", torch.empty(0, dtype=torch.long), persistent=True)
-        self.register_buffer("vocab_token_center_distances", torch.empty(0), persistent=True)
-        self.register_buffer("vocab_token_ranks", torch.empty(0, dtype=torch.long), persistent=True)
-        self.register_buffer("vocab_cluster_sizes", torch.empty(self.cluster_num, dtype=torch.long), persistent=True)
-        self.register_buffer("patch_to_vocab_cluster", torch.empty(self.cluster_num, dtype=torch.long), persistent=True)
-        self.register_buffer("vocab_to_patch_cluster", torch.empty(self.cluster_num, dtype=torch.long), persistent=True)
-        self.register_buffer("fitted", torch.tensor(False), persistent=True)
+        self.register_buffer("train_patches", torch.empty(0, self.patch_len, self.c_in), persistent=False)
+        self.register_buffer("train_patch_token_ids", torch.empty(0, dtype=torch.long), persistent=False)
+        self.register_buffer("patch_centers", torch.empty(self.cluster_num, self.patch_len * self.c_in), persistent=False)
+        self.register_buffer("patch_cluster_ids", torch.empty(0, dtype=torch.long), persistent=False)
+        self.register_buffer("patch_center_distances", torch.empty(0), persistent=False)
+        self.register_buffer("vocab_centers", torch.empty(0, 0), persistent=False)
+        self.register_buffer("vocab_token_cluster_ids", torch.empty(0, dtype=torch.long), persistent=False)
+        self.register_buffer("vocab_token_center_distances", torch.empty(0), persistent=False)
+        self.register_buffer("vocab_token_ranks", torch.empty(0, dtype=torch.long), persistent=False)
+        self.register_buffer("vocab_cluster_sizes", torch.empty(self.cluster_num, dtype=torch.long), persistent=False)
+        self.register_buffer("patch_to_vocab_cluster", torch.empty(self.cluster_num, dtype=torch.long), persistent=False)
+        self.register_buffer("vocab_to_patch_cluster", torch.empty(self.cluster_num, dtype=torch.long), persistent=False)
+        self.register_buffer("fitted", torch.tensor(False), persistent=False)
         self.last_exact_match_count = 0
         self.last_total_match_count = 0
+        self.last_dropped_points = 0
 
     @property
     def ready(self):
@@ -163,9 +164,15 @@ class PatchTokenDictionary(nn.Module):
             raise ValueError(f"Expected {self.c_in} input channel(s), got {series.shape[-1]}.")
 
         remainder = series.shape[1] % self.patch_len
+        self.last_dropped_points = int(remainder)
         if remainder:
-            pad_len = self.patch_len - remainder
-            series = F.pad(series, (0, 0, 0, pad_len))
+            usable_length = series.shape[1] - remainder
+            if usable_length <= 0:
+                raise ValueError(
+                    f"Training series length {series.shape[1]} is shorter than patch_len {self.patch_len}; "
+                    "cannot build any full patch with drop_last."
+                )
+            series = series[:, :usable_length, :]
         patches = series.unfold(dimension=1, size=self.patch_len, step=self.patch_len)
         patches = patches.permute(0, 1, 3, 2).contiguous()
         return patches.reshape(-1, self.patch_len, self.c_in)
@@ -348,7 +355,44 @@ class PatchTokenDictionary(nn.Module):
             vocab_cluster_sizes=self.vocab_cluster_sizes.detach().cpu().numpy(),
             patch_to_vocab_cluster=self.patch_to_vocab_cluster.detach().cpu().numpy(),
             vocab_to_patch_cluster=self.vocab_to_patch_cluster.detach().cpu().numpy(),
+            cluster_num=np.array(self.cluster_num),
+            patch_len=np.array(self.patch_len),
+            c_in=np.array(self.c_in),
+            normalize=np.array(self.normalize),
+            seed=np.array(self.seed),
+            match_tol=np.array(self.match_tol),
+            dropped_points=np.array(self.last_dropped_points),
         )
+
+    @torch.no_grad()
+    def load_npz(self, path):
+        data = np.load(path)
+        device = self.train_patches.device
+        self.cluster_num = int(data["cluster_num"]) if "cluster_num" in data else int(data["patch_centers"].shape[0])
+        self.patch_len = int(data["patch_len"]) if "patch_len" in data else self.patch_len
+        self.c_in = int(data["c_in"]) if "c_in" in data else self.c_in
+        self.normalize = bool(data["normalize"]) if "normalize" in data else self.normalize
+        self.seed = int(data["seed"]) if "seed" in data else self.seed
+        self.match_tol = float(data["match_tol"]) if "match_tol" in data else self.match_tol
+        self.last_dropped_points = int(data["dropped_points"]) if "dropped_points" in data else 0
+
+        self.train_patches = torch.as_tensor(data["train_patches"], dtype=torch.float32, device=device)
+        self.train_patch_token_ids = torch.as_tensor(data["train_patch_token_ids"], dtype=torch.long, device=device)
+        self.patch_centers = torch.as_tensor(data["patch_centers"], dtype=torch.float32, device=device)
+        self.patch_cluster_ids = torch.as_tensor(data["patch_cluster_ids"], dtype=torch.long, device=device)
+        self.patch_center_distances = torch.as_tensor(data["patch_center_distances"], dtype=torch.float32, device=device)
+        self.vocab_centers = torch.as_tensor(data["vocab_centers"], dtype=torch.float32, device=device)
+        self.vocab_token_cluster_ids = torch.as_tensor(data["vocab_token_cluster_ids"], dtype=torch.long, device=device)
+        self.vocab_token_center_distances = torch.as_tensor(
+            data["vocab_token_center_distances"],
+            dtype=torch.float32,
+            device=device,
+        )
+        self.vocab_token_ranks = torch.as_tensor(data["vocab_token_ranks"], dtype=torch.long, device=device)
+        self.vocab_cluster_sizes = torch.as_tensor(data["vocab_cluster_sizes"], dtype=torch.long, device=device)
+        self.patch_to_vocab_cluster = torch.as_tensor(data["patch_to_vocab_cluster"], dtype=torch.long, device=device)
+        self.vocab_to_patch_cluster = torch.as_tensor(data["vocab_to_patch_cluster"], dtype=torch.long, device=device)
+        self.fitted.fill_(True)
 
 
 class GPT2TS(nn.Module):
@@ -434,6 +478,10 @@ class GPT2TS(nn.Module):
     @torch.no_grad()
     def save_patch_token_map(self, path):
         self.dictionary.save_npz(path)
+
+    @torch.no_grad()
+    def load_patch_token_map(self, path):
+        self.dictionary.load_npz(path)
 
     @torch.no_grad()
     def build_lm_training_tensors(self):
