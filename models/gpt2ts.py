@@ -429,6 +429,7 @@ class GPT2TS(nn.Module):
         self.gpt2 = self._load_gpt2(gpt_config)
         self._freeze_gpt2()
         self._inject_lora()
+        self._printed_generated_token_ids = False
 
         cluster_num = int(getattr(configs, "cluster_num", 128))
         self.dictionary = PatchTokenDictionary(
@@ -558,6 +559,9 @@ class GPT2TS(nn.Module):
         history_patches = self._patchify_batch(batch_x)
         history_token_ids = self.dictionary.patches_to_token_ids(history_patches)
         future_token_ids = self._generate_future_tokens(history_token_ids)
+        if not self._printed_generated_token_ids:
+            print("Generated future token ids:", future_token_ids.detach().cpu().tolist())
+            self._printed_generated_token_ids = True
         future_patches = self.dictionary.token_ids_to_patches(future_token_ids)
         pred = self._concat_patches(future_patches)
         aux = SimpleNamespace(history_token_ids=history_token_ids, future_token_ids=future_token_ids)
