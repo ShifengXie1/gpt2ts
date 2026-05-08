@@ -1,13 +1,11 @@
 import math
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoConfig, AutoModelForCausalLM
-
-from models.patchdecoder import OverlapAddPatchDecoder
-from models.patchtokenizer import PatchTokenizer
 
 
 KMEANS_TOL = 1e-6
@@ -17,7 +15,6 @@ KMEANS_MAX_ITERS = 100
 class LoRAConv1D(nn.Module):
     """LoRA adapter for GPT-2's Conv1D projections."""
 
-    # Initialize LoRA for Conv1D.
     def __init__(self, base_layer, r=8, alpha=16, dropout=0.0):
         super().__init__()
         self.base_layer = base_layer
@@ -34,7 +31,6 @@ class LoRAConv1D(nn.Module):
         self.lora_B = nn.Parameter(torch.zeros(out_features, self.r))
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
 
-    # Add the LoRA update.
     def forward(self, x):
         base = self.base_layer(x)
         if self.r <= 0:
@@ -44,34 +40,60 @@ class LoRAConv1D(nn.Module):
         return base + update
 
 
-class VocabPatchBridge(nn.Module):
-    """Bridge patches through GPT vocab clusters without clustering time-series inputs."""
+class PatchTokenDictionary(nn.Module):
+    """Full-train-set patch/token conversion table."""
 
-    def __init__(self, num_clusters, embed_dim, normalize=True, seed=0):
+    def __init__(self, cluster_num, patch_len, c_in, normalize=True, seed=0, match_tol=1e-6):
         super().__init__()
-        self.num_clusters = int(num_clusters)
-        self.embed_dim = int(embed_dim)
+        self.cluster_num = int(cluster_num)
+        self.patch_len = int(patch_len)
+        self.c_in = int(c_in)
         self.normalize = bool(normalize)
         self.seed = 0 if seed is None else int(seed)
-        self.register_buffer("vocab_centers", torch.empty(self.num_clusters, self.embed_dim), persistent=True)
-        self.register_buffer("vocab_token_center_ids", torch.empty(0, dtype=torch.long), persistent=False)
-        self.register_buffer("vocab_token_center_distances", torch.empty(0), persistent=False)
-        self.register_buffer("cluster_fitted", torch.tensor(False), persistent=True)
+        self.match_tol = float(match_tol)
+
+        self.register_buffer("train_patches", torch.empty(0, self.patch_len, self.c_in), persistent=True)
+        self.register_buffer("train_patch_token_ids", torch.empty(0, dtype=torch.long), persistent=True)
+        self.register_buffer("patch_centers", torch.empty(self.cluster_num, self.patch_len * self.c_in), persistent=True)
+        self.register_buffer("patch_cluster_ids", torch.empty(0, dtype=torch.long), persistent=True)
+        self.register_buffer("patch_center_distances", torch.empty(0), persistent=True)
+        self.register_buffer("vocab_centers", torch.empty(0, 0), persistent=True)
+        self.register_buffer("vocab_token_cluster_ids", torch.empty(0, dtype=torch.long), persistent=True)
+        self.register_buffer("vocab_token_center_distances", torch.empty(0), persistent=True)
+        self.register_buffer("vocab_token_ranks", torch.empty(0, dtype=torch.long), persistent=True)
+        self.register_buffer("vocab_cluster_sizes", torch.empty(self.cluster_num, dtype=torch.long), persistent=True)
+        self.register_buffer("patch_to_vocab_cluster", torch.empty(self.cluster_num, dtype=torch.long), persistent=True)
+        self.register_buffer("vocab_to_patch_cluster", torch.empty(self.cluster_num, dtype=torch.long), persistent=True)
+        self.register_buffer("fitted", torch.tensor(False), persistent=True)
+        self.last_exact_match_count = 0
+        self.last_total_match_count = 0
 
     @property
     def ready(self):
-        return bool(
-            self.cluster_fitted.item()
-            and self.vocab_centers.numel() > 0
-            and self.vocab_token_center_ids.numel() > 0
-        )
+        return bool(self.fitted.item() and self.train_patches.numel() > 0 and self.train_patch_token_ids.numel() > 0)
 
     def _resize_for_checkpoint(self, state_dict, prefix):
-        vocab_key = prefix + "vocab_centers"
-        if vocab_key in state_dict and self.vocab_centers.shape != state_dict[vocab_key].shape:
-            self.vocab_centers = torch.empty_like(state_dict[vocab_key])
-            self.num_clusters = int(self.vocab_centers.shape[0])
-            self.embed_dim = int(self.vocab_centers.shape[1])
+        centers_key = prefix + "patch_centers"
+        if centers_key in state_dict:
+            self.cluster_num = int(state_dict[centers_key].shape[0])
+        for name in (
+            "train_patches",
+            "train_patch_token_ids",
+            "patch_centers",
+            "patch_cluster_ids",
+            "patch_center_distances",
+            "vocab_centers",
+            "vocab_token_cluster_ids",
+            "vocab_token_center_distances",
+            "vocab_token_ranks",
+            "vocab_cluster_sizes",
+            "patch_to_vocab_cluster",
+            "vocab_to_patch_cluster",
+            "fitted",
+        ):
+            key = prefix + name
+            if key in state_dict and getattr(self, name).shape != state_dict[key].shape:
+                setattr(self, name, torch.empty_like(state_dict[key]))
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
         self._resize_for_checkpoint(state_dict, prefix)
@@ -85,14 +107,15 @@ class VocabPatchBridge(nn.Module):
             error_msgs,
         )
 
-    def fit_vocab(self, vocab_embeds):
-        self.vocab_centers = self._kmeans(vocab_embeds.float(), self.num_clusters, self.seed + 13)
-        self._assign_vocab_tokens(vocab_embeds.float())
-        self.cluster_fitted.fill_(True)
+    def _distance_source(self, x):
+        return F.normalize(x, dim=-1) if self.normalize else x
 
     @torch.no_grad()
     def _kmeans(self, x, k, seed):
-        x = x.detach().reshape(-1, x.shape[-1])
+        x = x.detach().float().reshape(-1, x.shape[-1])
+        if x.shape[0] == 0:
+            raise ValueError("Cannot run k-means on an empty tensor.")
+
         generator = torch.Generator(device=x.device)
         generator.manual_seed(seed)
         if x.shape[0] >= k:
@@ -103,9 +126,7 @@ class VocabPatchBridge(nn.Module):
 
         previous_assign = None
         for _ in range(KMEANS_MAX_ITERS):
-            distance_source = F.normalize(x, dim=-1) if self.normalize else x
-            distance_centers = F.normalize(centers, dim=-1) if self.normalize else centers
-            distances = torch.cdist(distance_source, distance_centers)
+            distances = torch.cdist(self._distance_source(x), self._distance_source(centers))
             assign = distances.argmin(dim=-1)
 
             if previous_assign is not None and torch.equal(assign, previous_assign):
@@ -124,197 +145,221 @@ class VocabPatchBridge(nn.Module):
             previous_assign = assign
         return centers
 
-    def _nearest_vocab_center(self, embeds):
-        source = F.normalize(embeds, dim=-1) if self.normalize else embeds
-        centers = F.normalize(self.vocab_centers, dim=-1) if self.normalize else self.vocab_centers
-        distances = torch.cdist(source.float(), centers.float())
-        return distances.argmin(dim=-1), distances.min(dim=-1).values
+    @torch.no_grad()
+    def _assign_to_centers(self, x, centers):
+        distances = torch.cdist(self._distance_source(x.float()), self._distance_source(centers.float()))
+        cluster_ids = distances.argmin(dim=-1)
+        center_distances = (x.float() - centers[cluster_ids].float()).norm(dim=-1)
+        return cluster_ids, center_distances
 
     @torch.no_grad()
-    def _assign_vocab_tokens(self, vocab_embeds):
-        center_ids, _ = self._nearest_vocab_center(vocab_embeds)
-        centers = self.vocab_centers[center_ids].to(device=vocab_embeds.device, dtype=vocab_embeds.dtype)
-        center_distances = (vocab_embeds - centers).norm(dim=-1)
-        self.vocab_token_center_ids = center_ids.detach()
-        self.vocab_token_center_distances = center_distances.detach()
+    def _patchify_series(self, series):
+        series = torch.as_tensor(series, dtype=torch.float32, device=self.train_patches.device)
+        if series.ndim == 2:
+            series = series.unsqueeze(0)
+        if series.ndim != 3:
+            raise ValueError("Expected train series with shape [T,C] or [1,T,C].")
+        if series.shape[-1] != self.c_in:
+            raise ValueError(f"Expected {self.c_in} input channel(s), got {series.shape[-1]}.")
 
-    def _ensure_vocab_token_assignments(self, vocab_embeds):
-        if (
-            self.vocab_token_center_ids.shape[:1] != vocab_embeds.shape[:1]
-            or self.vocab_token_center_ids.device != vocab_embeds.device
-            or self.vocab_token_center_distances.device != vocab_embeds.device
-        ):
-            self._assign_vocab_tokens(vocab_embeds.float())
+        remainder = series.shape[1] % self.patch_len
+        if remainder:
+            pad_len = self.patch_len - remainder
+            series = F.pad(series, (0, 0, 0, pad_len))
+        patches = series.unfold(dimension=1, size=self.patch_len, step=self.patch_len)
+        patches = patches.permute(0, 1, 3, 2).contiguous()
+        return patches.reshape(-1, self.patch_len, self.c_in)
 
-    def patch_cluster_ids(self, patch_count, device):
-        if patch_count > self.num_clusters:
-            raise ValueError(
-                f"Patch count {patch_count} exceeds vocab cluster count {self.num_clusters}; "
-                "increase the cluster count or reduce patch count."
-            )
-        generator = torch.Generator(device=device)
-        generator.manual_seed(self.seed + 29 + int(patch_count))
-        return torch.randperm(self.num_clusters, generator=generator, device=device)[:patch_count]
+    @torch.no_grad()
+    def _build_vocab_ranks(self, token_cluster_ids, token_distances):
+        vocab_ranks = torch.zeros_like(token_cluster_ids)
+        cluster_sizes = torch.zeros(self.cluster_num, dtype=torch.long, device=token_cluster_ids.device)
+        for cluster_id in range(self.cluster_num):
+            indices = torch.nonzero(token_cluster_ids == cluster_id, as_tuple=False).flatten()
+            cluster_sizes[cluster_id] = indices.numel()
+            if indices.numel() == 0:
+                continue
+            sorted_indices = indices[torch.argsort(token_distances[indices])]
+            vocab_ranks[sorted_indices] = torch.arange(indices.numel(), device=token_cluster_ids.device)
+        return vocab_ranks, cluster_sizes
 
-    def _match_vocab_tokens(self, cluster_ids, target_distances, vocab_embeds):
-        self._ensure_vocab_token_assignments(vocab_embeds)
-        flat_cluster_ids = cluster_ids.reshape(-1)
-        flat_target_distances = target_distances.detach().reshape(-1).float()
-        token_center_ids = self.vocab_token_center_ids.to(device=flat_cluster_ids.device)
-        token_distances = self.vocab_token_center_distances.detach().to(device=flat_cluster_ids.device).float()
+    @torch.no_grad()
+    def _map_train_patches_to_tokens(self):
+        token_ids = torch.empty(self.train_patches.shape[0], dtype=torch.long, device=self.train_patches.device)
+        non_empty_vocab_clusters = torch.nonzero(self.vocab_cluster_sizes > 0, as_tuple=False).flatten()
+        for patch_cluster_id in range(self.cluster_num):
+            patch_indices = torch.nonzero(self.patch_cluster_ids == patch_cluster_id, as_tuple=False).flatten()
+            if patch_indices.numel() == 0:
+                continue
 
-        selected_ids = []
-        max_error = torch.finfo(flat_target_distances.dtype).max
-        chunk_size = 256
+            vocab_cluster_id = int(self.patch_to_vocab_cluster[patch_cluster_id].item())
+            vocab_indices = torch.nonzero(self.vocab_token_cluster_ids == vocab_cluster_id, as_tuple=False).flatten()
+            if vocab_indices.numel() == 0:
+                if non_empty_vocab_clusters.numel() == 0:
+                    raise RuntimeError("No GPT vocab cluster has assigned tokens.")
+                center = self.vocab_centers[vocab_cluster_id].unsqueeze(0)
+                candidate_centers = self.vocab_centers[non_empty_vocab_clusters]
+                nearest_cluster_pos = torch.cdist(center.float(), candidate_centers.float()).argmin(dim=-1)
+                nearest_cluster_id = non_empty_vocab_clusters[nearest_cluster_pos].item()
+                vocab_indices = torch.nonzero(self.vocab_token_cluster_ids == nearest_cluster_id, as_tuple=False).flatten()
 
-        for start in range(0, flat_cluster_ids.numel(), chunk_size):
-            end = min(start + chunk_size, flat_cluster_ids.numel())
-            cluster_chunk = flat_cluster_ids[start:end]
-            target_chunk = flat_target_distances[start:end]
-            same_cluster = token_center_ids.unsqueeze(0) == cluster_chunk.unsqueeze(-1)
-            has_cluster_candidate = same_cluster.any(dim=-1, keepdim=True)
-            all_candidates = torch.ones_like(same_cluster, dtype=torch.bool)
-            candidate_mask = torch.where(has_cluster_candidate, same_cluster, all_candidates)
-            errors = (token_distances.unsqueeze(0) - target_chunk.unsqueeze(-1)).abs()
-            masked_errors = errors.masked_fill(~candidate_mask, max_error)
-            chunk_ids = masked_errors.argmin(dim=-1)
+            sorted_patch_indices = patch_indices[torch.argsort(self.patch_center_distances[patch_indices])]
+            sorted_vocab_indices = vocab_indices[torch.argsort(self.vocab_token_center_distances[vocab_indices])]
 
-            selected_ids.append(chunk_ids)
+            if sorted_patch_indices.numel() == 1:
+                mapped_positions = torch.full((1,), sorted_vocab_indices.numel() // 2, dtype=torch.long, device=token_ids.device)
+            else:
+                patch_positions = torch.arange(sorted_patch_indices.numel(), device=token_ids.device, dtype=torch.float32)
+                mapped_positions = torch.round(
+                    patch_positions * float(sorted_vocab_indices.numel() - 1) / float(sorted_patch_indices.numel() - 1)
+                ).long()
+            token_ids[sorted_patch_indices] = sorted_vocab_indices[mapped_positions]
+        return token_ids
 
-        return torch.cat(selected_ids, dim=0).reshape(cluster_ids.shape)
+    @torch.no_grad()
+    def fit(self, train_series, vocab_embeds):
+        train_patches = self._patchify_series(train_series)
+        flat_patches = train_patches.reshape(train_patches.shape[0], -1).float()
+        vocab_embeds = vocab_embeds.detach().float().to(flat_patches.device)
 
-    def z_to_vocab_embeddings(self, z_embeds, vocab_embeds):
+        patch_centers = self._kmeans(flat_patches, self.cluster_num, self.seed + 11)
+        patch_cluster_ids, patch_distances = self._assign_to_centers(flat_patches, patch_centers)
+
+        vocab_centers = self._kmeans(vocab_embeds, self.cluster_num, self.seed + 17)
+        vocab_cluster_ids, vocab_distances = self._assign_to_centers(vocab_embeds, vocab_centers)
+        vocab_ranks, vocab_cluster_sizes = self._build_vocab_ranks(vocab_cluster_ids, vocab_distances)
+
+        generator = torch.Generator(device=flat_patches.device)
+        generator.manual_seed(self.seed + 23)
+        patch_to_vocab = torch.randperm(self.cluster_num, generator=generator, device=flat_patches.device)
+        vocab_to_patch = torch.empty_like(patch_to_vocab)
+        vocab_to_patch[patch_to_vocab] = torch.arange(self.cluster_num, device=flat_patches.device)
+
+        self.train_patches = train_patches.detach()
+        self.patch_centers = patch_centers.detach()
+        self.patch_cluster_ids = patch_cluster_ids.detach()
+        self.patch_center_distances = patch_distances.detach()
+        self.vocab_centers = vocab_centers.detach()
+        self.vocab_token_cluster_ids = vocab_cluster_ids.detach()
+        self.vocab_token_center_distances = vocab_distances.detach()
+        self.vocab_token_ranks = vocab_ranks.detach()
+        self.vocab_cluster_sizes = vocab_cluster_sizes.detach()
+        self.patch_to_vocab_cluster = patch_to_vocab.detach()
+        self.vocab_to_patch_cluster = vocab_to_patch.detach()
+        self.train_patch_token_ids = self._map_train_patches_to_tokens().detach()
+        self.fitted.fill_(True)
+
+    @torch.no_grad()
+    def patches_to_token_ids(self, patches):
         if not self.ready:
-            raise RuntimeError("VocabPatchBridge must be fitted before mapping patches.")
-        if z_embeds.ndim != 3 or vocab_embeds.ndim != 2:
-            raise ValueError("Expected z_embeds [B,N,D] and vocab_embeds [V,D].")
-        if z_embeds.shape[-1] != vocab_embeds.shape[-1]:
-            raise ValueError("Patch and vocab embeddings must share embedding dimension.")
+            raise RuntimeError("PatchTokenDictionary must be fitted before converting patches to tokens.")
+        flat = patches.reshape(-1, self.patch_len * self.c_in).float()
+        train_flat = self.train_patches.reshape(self.train_patches.shape[0], -1).float()
+        distances = torch.cdist(flat, train_flat)
+        nearest_indices = distances.argmin(dim=-1)
+        nearest_distances = distances.gather(1, nearest_indices.unsqueeze(-1)).squeeze(-1)
+        self.last_exact_match_count = int((nearest_distances <= self.match_tol).sum().item())
+        self.last_total_match_count = int(flat.shape[0])
+        token_ids = self.train_patch_token_ids[nearest_indices]
+        return token_ids.reshape(patches.shape[0], patches.shape[1])
 
-        batch, patch_count, _ = z_embeds.shape
-        cluster_ids = self.patch_cluster_ids(patch_count, z_embeds.device)
-        cluster_ids = cluster_ids.unsqueeze(0).expand(batch, -1)
-        centers = self.vocab_centers[cluster_ids].to(device=z_embeds.device, dtype=z_embeds.dtype)
-        target_distances = (z_embeds - centers).norm(dim=-1)
-        token_ids = self._match_vocab_tokens(cluster_ids, target_distances, vocab_embeds)
-        selected_vocab_embeds = vocab_embeds[token_ids].to(device=z_embeds.device, dtype=z_embeds.dtype)
+    @torch.no_grad()
+    def token_ids_to_patches(self, token_ids):
+        if not self.ready:
+            raise RuntimeError("PatchTokenDictionary must be fitted before converting tokens to patches.")
 
-        aux = SimpleNamespace(
-            selected_vocab_token_ids=token_ids,
+        flat_tokens = token_ids.reshape(-1).long().clamp(min=0, max=self.vocab_token_cluster_ids.shape[0] - 1)
+        selected_patch_indices = torch.empty(flat_tokens.shape[0], dtype=torch.long, device=flat_tokens.device)
+
+        for pos, token_id in enumerate(flat_tokens):
+            vocab_cluster_id = int(self.vocab_token_cluster_ids[token_id].item())
+            patch_cluster_id = int(self.vocab_to_patch_cluster[vocab_cluster_id].item())
+            patch_indices = torch.nonzero(self.patch_cluster_ids == patch_cluster_id, as_tuple=False).flatten()
+            if patch_indices.numel() == 0:
+                patch_center = self.patch_centers[patch_cluster_id].unsqueeze(0)
+                train_flat = self.train_patches.reshape(self.train_patches.shape[0], -1).float()
+                selected_patch_indices[pos] = torch.cdist(patch_center.float(), train_flat).argmin(dim=-1).item()
+                continue
+
+            sorted_patch_indices = patch_indices[torch.argsort(self.patch_center_distances[patch_indices])]
+            token_cluster_size = int(self.vocab_cluster_sizes[vocab_cluster_id].item())
+            token_rank = int(self.vocab_token_ranks[token_id].item())
+            if token_cluster_size <= 1 or sorted_patch_indices.numel() == 1:
+                patch_pos = sorted_patch_indices.numel() // 2
+            else:
+                patch_pos = int(round(token_rank * float(sorted_patch_indices.numel() - 1) / float(token_cluster_size - 1)))
+            selected_patch_indices[pos] = sorted_patch_indices[patch_pos]
+
+        patches = self.train_patches[selected_patch_indices]
+        return patches.reshape(*token_ids.shape, self.patch_len, self.c_in)
+
+    @torch.no_grad()
+    def save_npz(self, path):
+        if not self.ready:
+            raise RuntimeError("Cannot save an unfitted PatchTokenDictionary.")
+        np.savez_compressed(
+            path,
+            train_patches=self.train_patches.detach().cpu().numpy(),
+            train_patch_token_ids=self.train_patch_token_ids.detach().cpu().numpy(),
+            patch_centers=self.patch_centers.detach().cpu().numpy(),
+            patch_cluster_ids=self.patch_cluster_ids.detach().cpu().numpy(),
+            patch_center_distances=self.patch_center_distances.detach().cpu().numpy(),
+            vocab_centers=self.vocab_centers.detach().cpu().numpy(),
+            vocab_token_cluster_ids=self.vocab_token_cluster_ids.detach().cpu().numpy(),
+            vocab_token_center_distances=self.vocab_token_center_distances.detach().cpu().numpy(),
+            vocab_token_ranks=self.vocab_token_ranks.detach().cpu().numpy(),
+            vocab_cluster_sizes=self.vocab_cluster_sizes.detach().cpu().numpy(),
+            patch_to_vocab_cluster=self.patch_to_vocab_cluster.detach().cpu().numpy(),
+            vocab_to_patch_cluster=self.vocab_to_patch_cluster.detach().cpu().numpy(),
         )
-        return selected_vocab_embeds, aux
-
-    def vocab_to_history_z(self, vocab_embeds, history_z_embeds):
-        if not self.ready:
-            raise RuntimeError("VocabPatchBridge must be fitted before inverse mapping.")
-        if vocab_embeds.ndim != 3 or history_z_embeds.ndim != 3:
-            raise ValueError("Expected vocab_embeds [B,F,D] and history_z_embeds [B,N,D].")
-        if vocab_embeds.shape[0] != history_z_embeds.shape[0] or vocab_embeds.shape[-1] != history_z_embeds.shape[-1]:
-            raise ValueError("Vocab and history-Z embeddings must share batch and embedding dimensions.")
-
-        history_count = history_z_embeds.shape[1]
-        history_cluster_ids = self.patch_cluster_ids(history_count, vocab_embeds.device)
-        cluster_to_patch = torch.full((self.num_clusters,), -1, dtype=torch.long, device=vocab_embeds.device)
-        cluster_to_patch[history_cluster_ids] = torch.arange(history_count, device=vocab_embeds.device)
-
-        pred_cluster_ids, _ = self._nearest_vocab_center(vocab_embeds)
-        selected_patch_indices = cluster_to_patch[pred_cluster_ids]
-        used_unassigned_fallback = selected_patch_indices < 0
-        if used_unassigned_fallback.any():
-            assigned_centers = self.vocab_centers[history_cluster_ids].to(device=vocab_embeds.device, dtype=vocab_embeds.dtype)
-            source = F.normalize(vocab_embeds, dim=-1) if self.normalize else vocab_embeds
-            centers = F.normalize(assigned_centers, dim=-1) if self.normalize else assigned_centers
-            assigned_distances = torch.cdist(source.float(), centers.float())
-            fallback_indices = assigned_distances.argmin(dim=-1)
-            selected_patch_indices = torch.where(used_unassigned_fallback, fallback_indices, selected_patch_indices)
-
-        gather_index = selected_patch_indices.unsqueeze(-1).expand(-1, -1, history_z_embeds.shape[-1])
-        selected_z = history_z_embeds.gather(dim=1, index=gather_index)
-        return selected_z
 
 
 class GPT2TS(nn.Module):
-    """Patch-cluster GPT2 forecaster with LoRA-tuned attention."""
+    """Patch-token GPT-2 forecaster using a full-train-set conversion table."""
 
-    # Initialize GPT2TS modules.
     def __init__(self, configs):
         super().__init__()
         self.configs = configs
-        self.seq_len = configs.seq_len
-        self.pred_len = configs.pred_len
-        self.c_in = configs.c_in
-        self.patch_len = configs.patch_len
-        self.stride = configs.stride
-        self.history_patch_count = self._patch_count(self.seq_len)
+        self.seq_len = int(configs.seq_len)
+        self.pred_len = int(configs.pred_len)
+        self.c_in = int(configs.c_in)
+        self.patch_len = int(configs.patch_len)
+        self.stride = int(configs.stride)
 
-        # gpt
-        self.gpt2_path = getattr(configs, "gpt_local_path", "./gpt") 
-        self.local_files_only = getattr(configs, "gpt_local_files_only", True) 
+        if getattr(configs, "features", "S") != "S" or self.c_in != 1:
+            raise ValueError("The patch-token GPT flow currently supports only features='S' with c_in=1.")
+        if self.stride != self.patch_len:
+            raise ValueError("This patch-token GPT flow requires non-overlap patches, so stride must equal patch_len.")
+        if self.seq_len % self.patch_len != 0:
+            raise ValueError("seq_len must be divisible by patch_len for non-overlap tokenization.")
+        if self.pred_len % self.patch_len != 0:
+            raise ValueError("pred_len must be divisible by patch_len for direct patch concatenation.")
+
+        self.history_patch_count = self.seq_len // self.patch_len
+        self.future_patch_count = self.pred_len // self.patch_len
+
+        self.gpt2_path = getattr(configs, "gpt_local_path", "./gpt")
+        self.local_files_only = getattr(configs, "gpt_local_files_only", True)
         gpt_config = AutoConfig.from_pretrained(self.gpt2_path, local_files_only=self.local_files_only)
-        requested_layers = configs.n_layers
+        requested_layers = int(getattr(configs, "n_layers", 0))
         if requested_layers > 0:
             gpt_config.n_layer = min(requested_layers, int(gpt_config.n_layer))
             gpt_config.num_hidden_layers = gpt_config.n_layer
-        self.gpt_dim = int(gpt_config.hidden_size)
         self.gpt2 = self._load_gpt2(gpt_config)
         self._freeze_gpt2()
         self._inject_lora()
-        self.bridge_weight = nn.Parameter(torch.eye(self.gpt_dim))
-        self.bridge_bias = nn.Parameter(torch.zeros(self.gpt_dim))
 
-        # tokenizer
-        self.patch_tokenizer = PatchTokenizer(
+        cluster_num = int(getattr(configs, "cluster_num", 128))
+        self.dictionary = PatchTokenDictionary(
+            cluster_num=cluster_num,
             patch_len=self.patch_len,
-            stride=self.stride,
             c_in=self.c_in,
-            gpt_dim=self.gpt_dim,
-            dropout=getattr(configs, "embedding_dropout", 0.05),
-        )
-        
-        # vocab-cluster bridge
-        cluster_seed = getattr(configs, "cluster_seed", 0)
-        self.bridge = VocabPatchBridge(
-            num_clusters=self.history_patch_count,
-            embed_dim=self.gpt_dim,
             normalize=getattr(configs, "cluster_normalize", True),
-            seed=cluster_seed,
-        )
-        self._fit_vocab_clusters()
-
-        if self.pred_len <= self.patch_len:
-            self.future_patch_count = 1
-        else:
-            self.future_patch_count = math.ceil((self.pred_len - self.patch_len) / self.stride) + 1
-        self.future_query = nn.Parameter(torch.empty(1, self.gpt_dim))
-        nn.init.normal_(self.future_query, mean=0.0, std=self.gpt_dim ** -0.5)
-
-        # decoder
-        self.decoder = OverlapAddPatchDecoder(
-            patch_len=self.patch_len,
-            stride=self.stride,
-            pred_len=self.pred_len,
-        )
-        self.output_dropout = nn.Dropout(float(getattr(configs, "dropout", 0.05)))
-
-    def _patch_count(self, length):
-        if length <= self.patch_len:
-            return 1
-        return math.ceil((length - self.patch_len) / self.stride) + 1
-
-    def _x_to_z(self, x_embeds):
-        return torch.matmul(x_embeds, self.bridge_weight.to(device=x_embeds.device, dtype=x_embeds.dtype)) + self.bridge_bias.to(
-            device=x_embeds.device,
-            dtype=x_embeds.dtype,
+            seed=getattr(configs, "cluster_seed", 0),
+            match_tol=getattr(configs, "patch_match_tol", 1e-6),
         )
 
-    def _z_to_x(self, z_embeds):
-        weight = self.bridge_weight.float()
-        inverse = torch.linalg.pinv(weight).to(device=z_embeds.device, dtype=z_embeds.dtype)
-        bias = self.bridge_bias.to(device=z_embeds.device, dtype=z_embeds.dtype)
-        return torch.matmul(z_embeds - bias, inverse)
-
-    # Load pretrained or fresh GPT-2.
-    def _load_gpt2(self, config):  
+    def _load_gpt2(self, config):
         if getattr(self.configs, "use_pretrained_gpt2", False):
             return AutoModelForCausalLM.from_pretrained(
                 self.gpt2_path,
@@ -323,14 +368,12 @@ class GPT2TS(nn.Module):
             )
         return AutoModelForCausalLM.from_config(config)
 
-    # Freeze base GPT-2 params.
     def _freeze_gpt2(self):
         for param in self.gpt2.parameters():
             param.requires_grad = False
 
-    # Inject LoRA into attention projections.
     def _inject_lora(self):
-        r = int(getattr(self.configs, "lora_r", 8))
+        r = int(getattr(self.configs, "lora_r", 0))
         if r <= 0:
             return
         alpha = float(getattr(self.configs, "lora_alpha", 16))
@@ -344,142 +387,61 @@ class GPT2TS(nn.Module):
             if "c_proj" in targets:
                 block.attn.c_proj = LoRAConv1D(block.attn.c_proj, r=r, alpha=alpha, dropout=dropout)
 
-    # Get GPT input embeddings.
     def _vocab_weight(self):
         return self.gpt2.get_input_embeddings().weight.detach()
 
-    # Fit vocab clusters at init.
     @torch.no_grad()
-    def _fit_vocab_clusters(self):
-        if self.bridge.num_clusters <= 0:
-            return
-
-        vocab_embeds = self._vocab_weight().to(dtype=torch.float)
-        self.bridge.fit_vocab(vocab_embeds)
-
-    # Convert logits to predicted vocab embeddings.
-    def _predicted_vocab_embeddings(self, logits):
-        temperature = max(float(getattr(self.configs, "forecast_temperature", 1.0)), 1e-6)
-        top_k = int(getattr(self.configs, "forecast_top_k", 64))
-        vocab_weight = self._vocab_weight().to(device=logits.device, dtype=logits.dtype)
-
-        if top_k == 1:
-            token_ids = logits.argmax(dim=-1)
-            return vocab_weight[token_ids]
-
-        if top_k > 0 and top_k < logits.shape[-1]:
-            values, indices = torch.topk(logits, k=top_k, dim=-1)
-            probs = F.softmax(values / temperature, dim=-1)
-            selected = vocab_weight[indices]
-            return torch.einsum("bfk,bfkd->bfd", probs, selected)
-
-        probs = F.softmax(logits / temperature, dim=-1)
-        return torch.matmul(probs, vocab_weight)
-
-    def _soft_vocab_embeddings(self, logits):
-        temperature = max(float(getattr(self.configs, "aux_temperature", 1.0)), 1e-6)
-        top_k = int(getattr(self.configs, "aux_embed_top_k", 64))
-        vocab_weight = self._vocab_weight().to(device=logits.device, dtype=logits.dtype)
-
-        if top_k > 0 and top_k < logits.shape[-1]:
-            values, indices = torch.topk(logits, k=top_k, dim=-1)
-            probs = F.softmax(values / temperature, dim=-1)
-            selected = vocab_weight[indices]
-            return torch.einsum("bfk,bfkd->bfd", probs, selected)
-
-        probs = F.softmax(logits / temperature, dim=-1)
-        return torch.matmul(probs, vocab_weight)
+    def fit_patch_token_map(self, train_series):
+        self.dictionary.fit(train_series, self._vocab_weight())
 
     @torch.no_grad()
-    def _target_future_embeddings(self, batch_y):
-        target = batch_y[:, -self.pred_len :, :]
-        if target.shape[-1] != self.c_in:
-            return None, None
+    def save_patch_token_map(self, path):
+        self.dictionary.save_npz(path)
 
-        target_patches = self.patch_tokenizer.patchify(target)
-        target_patches = target_patches[:, : self.future_patch_count, :, :]
-        target_ts_embeds = self.patch_tokenizer.encode(target_patches, apply_dropout=False)
-        target_z_embeds = self._x_to_z(target_ts_embeds)
-        vocab_weight = self._vocab_weight().to(device=target_ts_embeds.device, dtype=target_ts_embeds.dtype)
-        target_vocab_embeds, target_vocab_mapping = self.bridge.z_to_vocab_embeddings(target_z_embeds, vocab_weight)
-        return (
-            target_vocab_embeds.detach(),
-            target_vocab_mapping.selected_vocab_token_ids.detach(),
+    def _patchify_batch(self, batch_x):
+        if batch_x.shape[1] != self.seq_len:
+            raise ValueError(f"Expected batch_x length {self.seq_len}, got {batch_x.shape[1]}.")
+        patches = batch_x.unfold(dimension=1, size=self.patch_len, step=self.patch_len)
+        patches = patches.permute(0, 1, 3, 2).contiguous()
+        return patches
+
+    def _concat_patches(self, patches):
+        return patches.reshape(patches.shape[0], patches.shape[1] * self.patch_len, self.c_in)[:, : self.pred_len, :]
+
+    @torch.no_grad()
+    def _generate_future_tokens(self, history_token_ids):
+        max_positions = int(getattr(self.gpt2.config, "n_positions", history_token_ids.shape[1] + self.future_patch_count))
+        max_history = max_positions - self.future_patch_count
+        if max_history <= 0:
+            raise ValueError("GPT context length is smaller than the requested future patch count.")
+        if history_token_ids.shape[1] > max_history:
+            history_token_ids = history_token_ids[:, -max_history:]
+
+        eos_token_id = self.gpt2.config.eos_token_id
+        pad_token_id = eos_token_id if eos_token_id is not None else 0
+        attention_mask = torch.ones_like(history_token_ids)
+        generated = self.gpt2.generate(
+            input_ids=history_token_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=self.future_patch_count,
+            do_sample=False,
+            pad_token_id=pad_token_id,
         )
+        return generated[:, -self.future_patch_count :]
 
-    def _auxiliary_loss(self, batch_y, aux):
-        token_weight = float(getattr(self.configs, "aux_token_loss_weight", 0.0))
-        embed_weight = float(getattr(self.configs, "aux_embed_loss_weight", 0.0))
-        if token_weight <= 0.0 and embed_weight <= 0.0:
-            return None
-
-        target_vocab_embeds, target_token_ids = self._target_future_embeddings(batch_y)
-        if target_vocab_embeds is None:
-            return None
-
-        total = aux.future_logits.new_zeros(())
-
-        if token_weight > 0.0:
-            token_loss = F.cross_entropy(
-                aux.future_logits.reshape(-1, aux.future_logits.shape[-1]).float(),
-                target_token_ids.reshape(-1),
-            )
-            total = total + token_weight * token_loss.to(dtype=total.dtype)
-
-        if embed_weight > 0.0:
-            pred_vocab_embeds = self._soft_vocab_embeddings(aux.future_logits)
-            pred = F.normalize(pred_vocab_embeds.float(), dim=-1)
-            target = F.normalize(target_vocab_embeds.float(), dim=-1)
-            embed_loss = F.mse_loss(pred, target)
-            total = total + embed_weight * embed_loss.to(dtype=total.dtype)
-
-        return total
-
-    # Forecast future values.
+    @torch.no_grad()
     def forecast(self, batch_x):
-        history_patches = self.patch_tokenizer.patchify(batch_x)
-        history_ts_embeds = self.patch_tokenizer.encode(history_patches)
-        history_z_embeds = self._x_to_z(history_ts_embeds)
-        vocab_weight = self._vocab_weight().to(device=batch_x.device, dtype=history_ts_embeds.dtype)
-        history_llm_embeds, _ = self.bridge.z_to_vocab_embeddings(
-            history_z_embeds,
-            vocab_weight,
-        )
-        history_llm_embeds = self.output_dropout(history_llm_embeds)
+        if not self.dictionary.ready:
+            raise RuntimeError("Call fit_patch_token_map with the full training set before forecasting.")
 
-        future_queries = self.future_query.unsqueeze(0).expand(batch_x.shape[0], self.future_patch_count, -1)
-        inputs_embeds = torch.cat([history_llm_embeds, future_queries], dim=1)
-        attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=batch_x.device)
-
-        outputs = self.gpt2(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
-        future_logits = outputs.logits[:, -self.future_patch_count :, :]
-        pred_vocab_embeds = self._predicted_vocab_embeddings(future_logits)
-        pred_z_embeds = self.bridge.vocab_to_history_z(
-            pred_vocab_embeds,
-            history_z_embeds,
-        )
-        pred_x_queries = self._z_to_x(pred_z_embeds)
-        x_distances = torch.cdist(pred_x_queries.float(), history_ts_embeds.float())
-        selected_patch_indices = x_distances.argmin(dim=-1)
-        gather_index = selected_patch_indices.unsqueeze(-1).unsqueeze(-1).expand(
-            -1,
-            -1,
-            history_patches.shape[-2],
-            history_patches.shape[-1],
-        )
-        pred_patches = history_patches.gather(dim=1, index=gather_index)
-
-        pred = self.decoder(pred_patches)
-        pred = pred[:, : self.pred_len, :]
-        aux = SimpleNamespace(
-            future_logits=future_logits,
-        )
+        history_patches = self._patchify_batch(batch_x)
+        history_token_ids = self.dictionary.patches_to_token_ids(history_patches)
+        future_token_ids = self._generate_future_tokens(history_token_ids)
+        future_patches = self.dictionary.token_ids_to_patches(future_token_ids)
+        pred = self._concat_patches(future_patches)
+        aux = SimpleNamespace(history_token_ids=history_token_ids, future_token_ids=future_token_ids)
         return pred, aux
 
-    # Return prediction, optional loss, and aux data.
     def forward(self, batch_x, batch_y=None):
         pred, aux = self.forecast(batch_x)
-        loss = None
-        if batch_y is not None:
-            loss = self._auxiliary_loss(batch_y, aux)
-        return SimpleNamespace(pred=pred, loss=loss, aux=aux)
+        return SimpleNamespace(pred=pred, loss=None, aux=aux)

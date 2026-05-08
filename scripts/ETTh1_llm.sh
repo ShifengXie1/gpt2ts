@@ -17,10 +17,9 @@ BATCH_SIZE=8
 PATCH_SIZE=8
 STRIDE=8
 N_LAYERS=0
+CLUSTER_NUM=128
 FORECAST_TOP_K=1
-AUX_TOKEN_LOSS_WEIGHT=1
-AUX_EMBED_LOSS_WEIGHT=1
-LORA_R=8
+LORA_R=0
 LORA_ALPHA=16
 LORA_DROPOUT=0.05
 
@@ -28,7 +27,7 @@ LORA_DROPOUT=0.05
 for pred_len in "${PRED_LENS[@]}"; do
     python -u run.py \
         --data "$DATA_NAME" \
-        --features M \
+        --features S \
         --seq_len "$SEQ_LEN" \
         --pred_len "$pred_len" \
         --batch_size "$BATCH_SIZE" \
@@ -39,9 +38,8 @@ for pred_len in "${PRED_LENS[@]}"; do
         --patch_len "$PATCH_SIZE" \
         --stride "$STRIDE" \
         --n_layers "$N_LAYERS" \
+        --cluster_num "$CLUSTER_NUM" \
         --forecast_top_k "$FORECAST_TOP_K" \
-        --aux_token_loss_weight "$AUX_TOKEN_LOSS_WEIGHT" \
-        --aux_embed_loss_weight "$AUX_EMBED_LOSS_WEIGHT" \
         --lora_r "$LORA_R" \
         --lora_alpha "$LORA_ALPHA" \
         --lora_dropout "$LORA_DROPOUT" \

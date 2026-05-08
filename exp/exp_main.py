@@ -103,12 +103,42 @@ class Exp_Main(Exp_Basic):
 
     # Run training and early stopping.
     def train(self, setting):
-        _, train_loader = self._get_data(flag="train")
+        train_data, train_loader = self._get_data(flag="train")
         _, vali_loader = self._get_data(flag="val")
         _, test_loader = self._get_data(flag="test")
 
         checkpoint_dir = os.path.join(self.results_dir, setting, self.timestamp, "checkpoints")
         os.makedirs(checkpoint_dir, exist_ok=True)
+
+        if hasattr(self.model, "fit_patch_token_map"):
+            if not hasattr(train_data, "data_x"):
+                raise ValueError("The patch-token GPT flow requires a dataset with full training data in data_x.")
+
+            fit_start = time.time()
+            self.model.eval()
+            self.model.fit_patch_token_map(train_data.data_x)
+
+            save_dir = os.path.join(self.results_dir, setting, self.timestamp)
+            os.makedirs(save_dir, exist_ok=True)
+            self.model.save_patch_token_map(os.path.join(save_dir, "patch_token_map.npz"))
+            torch.save(self.model.state_dict(), os.path.join(checkpoint_dir, "checkpoint.pth"))
+
+            vali_loss, vali_mae = self.vali(vali_loader)
+            test_loss, test_mae = self.vali(test_loader)
+            self.min_test_loss = test_loss
+            self.min_test_mae = test_mae
+            self.epoch_for_min_test_loss = 0
+            print("Patch-token map fitted in {:.2f} sec".format(time.time() - fit_start))
+            print(
+                "\tFit-only | Train patches: {0} | Vali.MSE: {1:.5f} Vali.MAE: {2:.5f} Test.MSE: {3:.5f} Test.MAE: {4:.5f}".format(
+                    self.model.dictionary.train_patches.shape[0],
+                    vali_loss,
+                    vali_mae,
+                    test_loss,
+                    test_mae,
+                )
+            )
+            return self.model
 
         train_steps = len(train_loader)
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
@@ -127,8 +157,8 @@ class Exp_Main(Exp_Basic):
                 model_optim.zero_grad(set_to_none=True)
                 pred, true, output = self._process_one_batch(batch, return_output=True)
                 main_loss = criterion(pred, true)
-                aux_loss = output.loss if hasattr(output, "loss") else None
-                loss = main_loss if aux_loss is None else main_loss + aux_loss
+                model_loss = output.loss if hasattr(output, "loss") else None
+                loss = main_loss if model_loss is None else main_loss + model_loss
 
                 if self.amp_enabled:
                     scaler.scale(loss).backward()
