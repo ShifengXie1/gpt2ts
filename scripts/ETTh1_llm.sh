@@ -19,7 +19,6 @@ PATCH_SIZE=8
 STRIDE=8
 N_LAYERS=0
 CLUSTER_NUM=128
-STANDARD_SCALE_FACTOR=10
 TOKEN_TRAIN_STRIDE=1
 LORA_R=8
 LORA_ALPHA=16
@@ -42,7 +41,6 @@ for pred_len in "${PRED_LENS[@]}"; do
         --stride "$STRIDE" \
         --n_layers "$N_LAYERS" \
         --cluster_num "$CLUSTER_NUM" \
-        --standard_scale_factor "$STANDARD_SCALE_FACTOR" \
         --token_train_stride "$TOKEN_TRAIN_STRIDE" \
         --lora_r "$LORA_R" \
         --lora_alpha "$LORA_ALPHA" \

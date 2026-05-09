@@ -66,7 +66,6 @@ def build_args():
     parser.add_argument("--freq", type=str, default="h", help="time feature frequency")
     parser.add_argument("--seasonal_patterns", type=str, default="Monthly", help="seasonality for M4")
     parser.add_argument("--augmentation_ratio", type=float, default=0.0, help="data augmentation ratio")
-    parser.add_argument("--standard_scale_factor", type=float, default=1.0, help="extra multiplier after StandardScaler")
     parser.add_argument("--model_id", type=str, default="ETTh1", help="dataset id used by UEA loader")
     
 
