@@ -27,6 +27,9 @@ class Exp_Main(Exp_Basic):
         self.epoch_for_min_test_loss = -1
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.amp_enabled = bool(self.args.use_amp and self.device.type == "cuda")
+        self.standard_scale_factor = float(getattr(self.args, "standard_scale_factor", 1.0) or 1.0)
+        if self.standard_scale_factor <= 0:
+            raise ValueError("standard_scale_factor must be positive.")
 
     # Build the GPT2TS model.
     def _build_model(self):
@@ -50,6 +53,21 @@ class Exp_Main(Exp_Basic):
         except KeyError as exc:
             raise ValueError(f"Invalid loss: {self.args.loss}") from exc
 
+    def _scale_standardized_tensor(self, tensor):
+        if self.standard_scale_factor == 1.0:
+            return tensor
+        return tensor * self.standard_scale_factor
+
+    def _scale_standardized_array(self, array):
+        if self.standard_scale_factor == 1.0:
+            return array
+        return array * self.standard_scale_factor
+
+    def _unscale_standardized_array(self, array):
+        if self.standard_scale_factor == 1.0:
+            return array
+        return array / self.standard_scale_factor
+
     # Align prediction horizon and channels.
     def _align_prediction_and_target(self, pred, target):
         pred = pred[:, -self.args.pred_len :, :]
@@ -69,6 +87,8 @@ class Exp_Main(Exp_Basic):
         
         batch_x = batch_x.to(dtype=torch.float, device=self.device)
         target = target.to(dtype=torch.float, device=self.device)
+        batch_x = self._scale_standardized_tensor(batch_x)
+        target = self._scale_standardized_tensor(target)
         model_target = target if return_output else None
         
         if self.amp_enabled:
@@ -237,7 +257,7 @@ class Exp_Main(Exp_Basic):
 
             fit_start = time.time()
             self.model.eval()
-            self.model.fit_patch_token_map(train_data.data_x)
+            self.model.fit_patch_token_map(self._scale_standardized_array(train_data.data_x))
 
             save_dir = os.path.join(self.results_dir, setting, self.timestamp)
             os.makedirs(save_dir, exist_ok=True)
@@ -334,6 +354,7 @@ class Exp_Main(Exp_Basic):
             return None
         original_shape = array.shape
         flat = array.reshape(-1, original_shape[-1])
+        flat = self._unscale_standardized_array(flat)
         try:
             restored = data_set.inverse_transform(flat)
         except Exception:
@@ -459,6 +480,7 @@ class Exp_Main(Exp_Basic):
             file.write(f"saved_at: {self.timestamp}\n")
             file.write(f"setting: {setting}\n")
             file.write(f"features: {self.args.features}\n")
+            file.write(f"standard_scale_factor: {self.standard_scale_factor}\n")
             file.write(
                 "test_loss={test_loss:.6f} | mse={mse:.6f}, mae={mae:.6f}, "
                 "rmse={rmse:.6f}, mape={mape:.6f}, mspe={mspe:.6f}\n".format(**metrics)
