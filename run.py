@@ -7,17 +7,6 @@ from exp.exp_main import Exp_Main
 from utils.tools import set_random_seed
 
 
-def str2bool(value):
-    if isinstance(value, bool):
-        return value
-    value = str(value).strip().lower()
-    if value in {"true", "1", "yes", "y"}:
-        return True
-    if value in {"false", "0", "no", "n"}:
-        return False
-    raise argparse.ArgumentTypeError(f"Expected a boolean value, got {value!r}.")
-
-
 def build_args():
     parser = argparse.ArgumentParser()
     
@@ -46,8 +35,6 @@ def build_args():
     parser.add_argument('--cluster_normalize', type=bool, default=True, help='normalize embeddings when assigning clusters')
     parser.add_argument('--cluster_seed', type=int, default=None, help='seed for cluster init and random center mapping')
     parser.add_argument('--patch_match_tol', type=float, default=1e-6, help='tolerance for exact patch lookup before nearest-neighbor fallback')
-    parser.add_argument('--patch_level_normalize', type=str2bool, default=True, help='normalize each patch before clustering and nearest-neighbor matching')
-    parser.add_argument('--patch_norm_eps', type=float, default=1e-5, help='epsilon for patch-level normalization')
     parser.add_argument('--token_train_stride', type=int, default=1, help='stride over train patch-token windows for GPT/LoRA training')
     parser.add_argument('--lora_r', type=int, default=8, help='LoRA rank for GPT-2 attention projections')
     parser.add_argument('--lora_alpha', type=float, default=16.0, help='LoRA alpha')

@@ -51,8 +51,6 @@ class PatchTokenDictionary(nn.Module):
         normalize=True,
         seed=0,
         match_tol=1e-6,
-        patch_level_normalize=True,
-        patch_norm_eps=1e-5,
     ):
         super().__init__()
         self.cluster_num = int(cluster_num)
@@ -61,11 +59,9 @@ class PatchTokenDictionary(nn.Module):
         self.normalize = bool(normalize)
         self.seed = 0 if seed is None else int(seed)
         self.match_tol = float(match_tol)
-        self.patch_level_normalize = bool(patch_level_normalize)
-        self.patch_norm_eps = float(patch_norm_eps)
 
         self.register_buffer("train_patches", torch.empty(0, self.patch_len, self.c_in), persistent=False)
-        self.register_buffer("train_patches_normalized", torch.empty(0, self.patch_len, self.c_in), persistent=False)
+        self.register_buffer("train_patch_features", torch.empty(0, self.patch_len, self.c_in), persistent=False)
         self.register_buffer("train_patch_token_ids", torch.empty(0, dtype=torch.long), persistent=False)
         self.register_buffer("patch_centers", torch.empty(self.cluster_num, self.patch_len * self.c_in), persistent=False)
         self.register_buffer("patch_cluster_ids", torch.empty(0, dtype=torch.long), persistent=False)
@@ -87,7 +83,7 @@ class PatchTokenDictionary(nn.Module):
         return bool(
             self.fitted.item()
             and self.train_patches.numel() > 0
-            and self.train_patches_normalized.numel() > 0
+            and self.train_patch_features.numel() > 0
             and self.train_patch_token_ids.numel() > 0
         )
 
@@ -97,7 +93,7 @@ class PatchTokenDictionary(nn.Module):
             self.cluster_num = int(state_dict[centers_key].shape[0])
         for name in (
             "train_patches",
-            "train_patches_normalized",
+            "train_patch_features",
             "train_patch_token_ids",
             "patch_centers",
             "patch_cluster_ids",
@@ -130,13 +126,9 @@ class PatchTokenDictionary(nn.Module):
     def _distance_source(self, x):
         return F.normalize(x, dim=-1) if self.normalize else x
 
-    def _normalize_patches(self, patches):
-        patches = patches.float()
-        if not self.patch_level_normalize:
-            return patches
-        mean = patches.mean(dim=(1, 2), keepdim=True)
-        var = patches.var(dim=(1, 2), keepdim=True, unbiased=False)
-        return (patches - mean) / torch.sqrt(var + self.patch_norm_eps)
+    def _patch_features(self, patches):
+        # Data loaders already scale the series; do not standardize each patch again.
+        return patches.float()
 
     @torch.no_grad()
     def _kmeans(self, x, k, seed):
@@ -253,8 +245,8 @@ class PatchTokenDictionary(nn.Module):
     @torch.no_grad()
     def fit(self, train_series, vocab_embeds):
         train_patches = self._patchify_series(train_series)
-        train_patches_normalized = self._normalize_patches(train_patches)
-        flat_patches = train_patches_normalized.reshape(train_patches_normalized.shape[0], -1).float()
+        train_patch_features = self._patch_features(train_patches)
+        flat_patches = train_patch_features.reshape(train_patch_features.shape[0], -1).float()
         vocab_embeds = vocab_embeds.detach().float().to(flat_patches.device)
 
         patch_centers = self._kmeans(flat_patches, self.cluster_num, self.seed + 11)
@@ -271,7 +263,7 @@ class PatchTokenDictionary(nn.Module):
         vocab_to_patch[patch_to_vocab] = torch.arange(self.cluster_num, device=flat_patches.device)
 
         self.train_patches = train_patches.detach()
-        self.train_patches_normalized = train_patches_normalized.detach()
+        self.train_patch_features = train_patch_features.detach()
         self.patch_centers = patch_centers.detach()
         self.patch_cluster_ids = patch_cluster_ids.detach()
         self.patch_center_distances = patch_distances.detach()
@@ -289,8 +281,8 @@ class PatchTokenDictionary(nn.Module):
     def patches_to_token_ids(self, patches):
         if not self.ready:
             raise RuntimeError("PatchTokenDictionary must be fitted before converting patches to tokens.")
-        normalized_patches = self._normalize_patches(patches.reshape(-1, self.patch_len, self.c_in))
-        flat = normalized_patches.reshape(normalized_patches.shape[0], -1).float()
+        patch_features = self._patch_features(patches.reshape(-1, self.patch_len, self.c_in))
+        flat = patch_features.reshape(patch_features.shape[0], -1).float()
         query_cluster_ids, _ = self._assign_to_centers(flat, self.patch_centers)
         selected_indices = torch.empty(flat.shape[0], dtype=torch.long, device=flat.device)
         selected_distances = torch.empty(flat.shape[0], dtype=flat.dtype, device=flat.device)
@@ -301,7 +293,7 @@ class PatchTokenDictionary(nn.Module):
         if non_empty_clusters.numel() == 0:
             raise RuntimeError("No train patch cluster has assigned patches.")
 
-        train_flat = self.train_patches_normalized.reshape(self.train_patches_normalized.shape[0], -1).float()
+        train_flat = self.train_patch_features.reshape(self.train_patch_features.shape[0], -1).float()
         chunk_size = max(int(getattr(self, "nearest_chunk_size", 1024)), 1)
 
         for cluster_id in torch.unique(query_cluster_ids):
@@ -351,7 +343,7 @@ class PatchTokenDictionary(nn.Module):
             patch_indices = torch.nonzero(self.patch_cluster_ids == patch_cluster_id, as_tuple=False).flatten()
             if patch_indices.numel() == 0:
                 patch_center = self.patch_centers[patch_cluster_id].unsqueeze(0)
-                train_flat = self.train_patches_normalized.reshape(self.train_patches_normalized.shape[0], -1).float()
+                train_flat = self.train_patch_features.reshape(self.train_patch_features.shape[0], -1).float()
                 selected_patch_indices[pos] = torch.cdist(patch_center.float(), train_flat).argmin(dim=-1).item()
                 continue
 
@@ -389,8 +381,6 @@ class PatchTokenDictionary(nn.Module):
             patch_len=np.array(self.patch_len),
             c_in=np.array(self.c_in),
             normalize=np.array(self.normalize),
-            patch_level_normalize=np.array(self.patch_level_normalize),
-            patch_norm_eps=np.array(self.patch_norm_eps),
             seed=np.array(self.seed),
             match_tol=np.array(self.match_tol),
             dropped_points=np.array(self.last_dropped_points),
@@ -404,14 +394,17 @@ class PatchTokenDictionary(nn.Module):
         self.patch_len = int(data["patch_len"]) if "patch_len" in data else self.patch_len
         self.c_in = int(data["c_in"]) if "c_in" in data else self.c_in
         self.normalize = bool(data["normalize"]) if "normalize" in data else self.normalize
-        self.patch_level_normalize = bool(data["patch_level_normalize"]) if "patch_level_normalize" in data else False
-        self.patch_norm_eps = float(data["patch_norm_eps"]) if "patch_norm_eps" in data else self.patch_norm_eps
+        if "patch_level_normalize" in data and bool(data["patch_level_normalize"]):
+            raise ValueError(
+                "This patch-token map was saved with patch-level normalization. "
+                "Refit the patch-token map because patch-level normalization has been removed."
+            )
         self.seed = int(data["seed"]) if "seed" in data else self.seed
         self.match_tol = float(data["match_tol"]) if "match_tol" in data else self.match_tol
         self.last_dropped_points = int(data["dropped_points"]) if "dropped_points" in data else 0
 
         self.train_patches = torch.as_tensor(data["train_patches"], dtype=torch.float32, device=device)
-        self.train_patches_normalized = self._normalize_patches(self.train_patches).detach()
+        self.train_patch_features = self._patch_features(self.train_patches).detach()
         self.train_patch_token_ids = torch.as_tensor(data["train_patch_token_ids"], dtype=torch.long, device=device)
         self.patch_centers = torch.as_tensor(data["patch_centers"], dtype=torch.float32, device=device)
         self.patch_cluster_ids = torch.as_tensor(data["patch_cluster_ids"], dtype=torch.long, device=device)
@@ -474,8 +467,6 @@ class GPT2TS(nn.Module):
             normalize=getattr(configs, "cluster_normalize", True),
             seed=getattr(configs, "cluster_seed", 0),
             match_tol=getattr(configs, "patch_match_tol", 1e-6),
-            patch_level_normalize=getattr(configs, "patch_level_normalize", True),
-            patch_norm_eps=getattr(configs, "patch_norm_eps", 1e-5),
         )
 
     def _load_gpt2(self, config):
