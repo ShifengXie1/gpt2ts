@@ -457,7 +457,6 @@ class GPT2TS(nn.Module):
         self.gpt2 = self._load_gpt2(gpt_config)
         self._freeze_gpt2()
         self._inject_lora()
-        self._printed_generated_token_ids = False
 
         cluster_num = int(getattr(configs, "cluster_num", 128))
         self.dictionary = PatchTokenDictionary(
@@ -595,20 +594,6 @@ class GPT2TS(nn.Module):
         history_patches = self._patchify_batch(batch_x)
         history_token_ids = self.dictionary.patches_to_token_ids(history_patches)
         future_token_ids = self._generate_future_tokens(history_token_ids)
-        if not self._printed_generated_token_ids:
-            print("Generated future token ids:", future_token_ids.detach().cpu().tolist())
-            generated_cpu = future_token_ids.detach().cpu()
-            unique_counts = [len(set(row.tolist())) for row in generated_cpu]
-            print("Generated unique token counts:", unique_counts)
-            train_tokens = self.dictionary.train_patch_token_ids.detach().cpu()
-            for sample_idx, row in enumerate(generated_cpu):
-                ids, counts = torch.unique(row, return_counts=True)
-                train_counts = [
-                    (int(token_id), int(gen_count), int((train_tokens == token_id).sum()))
-                    for token_id, gen_count in zip(ids, counts)
-                ]
-                print(f"Generated token train freq sample {sample_idx}: {train_counts}")
-            self._printed_generated_token_ids = True
         future_patches = self.dictionary.token_ids_to_patches(future_token_ids)
         pred = self._concat_patches(future_patches)
         aux = SimpleNamespace(history_token_ids=history_token_ids, future_token_ids=future_token_ids)
