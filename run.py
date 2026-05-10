@@ -24,8 +24,6 @@ def build_args():
     parser.add_argument('--weight_decay', type = float, default = 0.00, help = 'pytorch weight decay factor')
     parser.add_argument('--patch_len', type = int, default = 16, help = 'Patch size')
     parser.add_argument('--stride', type = int, default = 16, help = 'Stride')
-    parser.add_argument('--dropout', type = float, default = 0.05, help = 'dropout for output layer')
-    parser.add_argument('--embedding_dropout', type = float, default = 0.05, help = 'dropout for embedding layer')
     parser.add_argument('--patience', type = int, default = 10, help = 'patience')
     parser.add_argument('--train_epochs', type = int, default = 10, help = 'train epochs')
     parser.add_argument('--loss', type=str, default='mse', choices=['mse', 'smoothL1'])
