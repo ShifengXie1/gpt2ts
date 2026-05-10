@@ -376,7 +376,7 @@ class Exp_Main(Exp_Basic):
         fig.savefig(os.path.join(view_dir, f"{file_prefix}_prediction_vs_true.png"), dpi=160)
         plt.close(fig)
 
-    def _save_batch_curve_views_from_files(self, save_dir):
+    def _save_batch_curve_views_from_files(self, save_dir, max_batches=100):
         pred_path = os.path.join(save_dir, "pred.npy")
         true_path = os.path.join(save_dir, "true.npy")
         pred_all = np.load(pred_path)
@@ -384,6 +384,8 @@ class Exp_Main(Exp_Basic):
         batch_size = max(int(self.args.batch_size), 1)
 
         for batch_idx, start in enumerate(range(0, pred_all.shape[0], batch_size)):
+            if batch_idx >= max_batches:
+                break
             end = min(start + batch_size, pred_all.shape[0])
             self._save_batch_curve_view(
                 pred_all[start:end],
