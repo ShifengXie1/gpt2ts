@@ -329,17 +329,6 @@ class Exp_Main(Exp_Basic):
         return self.model
 
     # Test and save results.
-    def _inverse_transform_array(self, data_set, array):
-        if not hasattr(data_set, "inverse_transform"):
-            return None
-        original_shape = array.shape
-        flat = array.reshape(-1, original_shape[-1])
-        try:
-            restored = data_set.inverse_transform(flat)
-        except Exception:
-            return None
-        return restored.reshape(original_shape)
-
     def _save_batch_curve_view(self, pred_batch, true_batch, save_dir, max_samples=8, max_channels=8, view_name="batch_view"):
         import matplotlib
         matplotlib.use("Agg")
@@ -380,7 +369,7 @@ class Exp_Main(Exp_Basic):
         plt.close(fig)
 
     def test(self, setting):
-        test_data, test_loader = self._get_data(flag="test")
+        _, test_loader = self._get_data(flag="test")
         criterion = self._select_criterion()
         self.model.eval()
         preds, trues = [], []
@@ -404,46 +393,13 @@ class Exp_Main(Exp_Basic):
         test_loss = criterion(preds, trues).item()
         print("standardized mse: {}, mae: {}".format(mse, mae))
 
-        raw_metrics = None
-        preds_raw = self._inverse_transform_array(test_data, preds.numpy())
-        trues_raw = self._inverse_transform_array(test_data, trues.numpy())
-        if preds_raw is not None and trues_raw is not None:
-            raw_mae, raw_mse, raw_rmse, raw_mape, raw_mspe = metric(preds_raw, trues_raw)
-            raw_metrics = {
-                "raw_mse": raw_mse,
-                "raw_mae": raw_mae,
-                "raw_rmse": raw_rmse,
-                "raw_mape": raw_mape,
-                "raw_mspe": raw_mspe,
-            }
-            print("raw-scale mse: {}, mae: {}".format(raw_mse, raw_mae))
-
         save_dir = os.path.join(self.results_dir, setting, self.timestamp)
         os.makedirs(save_dir, exist_ok=True)
         np.save(os.path.join(save_dir, "metrics.npy"), np.array([mae, mse, rmse, mape, mspe]))
         np.save(os.path.join(save_dir, "pred.npy"), preds.numpy())
         np.save(os.path.join(save_dir, "true.npy"), trues.numpy())
-        view_pred_raw, view_true_raw = None, None
-        if raw_metrics is not None:
-            np.save(
-                os.path.join(save_dir, "metrics_raw.npy"),
-                np.array([
-                    raw_metrics["raw_mae"],
-                    raw_metrics["raw_mse"],
-                    raw_metrics["raw_rmse"],
-                    raw_metrics["raw_mape"],
-                    raw_metrics["raw_mspe"],
-                ]),
-            )
-            np.save(os.path.join(save_dir, "pred_raw.npy"), preds_raw)
-            np.save(os.path.join(save_dir, "true_raw.npy"), trues_raw)
-            if view_pred is not None and view_true is not None:
-                view_pred_raw = self._inverse_transform_array(test_data, view_pred.detach().cpu().numpy())
-                view_true_raw = self._inverse_transform_array(test_data, view_true.detach().cpu().numpy())
         if view_pred is not None and view_true is not None:
             self._save_batch_curve_view(view_pred, view_true, save_dir)
-        if view_pred_raw is not None and view_true_raw is not None:
-            self._save_batch_curve_view(view_pred_raw, view_true_raw, save_dir, view_name="batch_view_raw")
 
         metrics = {
             "test_loss": test_loss,
@@ -463,13 +419,6 @@ class Exp_Main(Exp_Basic):
                 "test_loss={test_loss:.6f} | mse={mse:.6f}, mae={mae:.6f}, "
                 "rmse={rmse:.6f}, mape={mape:.6f}, mspe={mspe:.6f}\n".format(**metrics)
             )
-            if raw_metrics is not None:
-                file.write(
-                    "raw_mse={raw_mse:.6f}, raw_mae={raw_mae:.6f}, "
-                    "raw_rmse={raw_rmse:.6f}, raw_mape={raw_mape:.6f}, raw_mspe={raw_mspe:.6f}\n".format(
-                        **raw_metrics
-                    )
-                )
             file.write(f"\n")
             
         return mse, mae
