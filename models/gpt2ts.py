@@ -554,7 +554,7 @@ class GPT2TS(nn.Module):
         windows = tokens.unfold(dimension=0, size=window_size, step=step).contiguous()
         input_ids = windows[:, :-1].contiguous()
         labels = windows[:, 1:].contiguous()
-        # labels[:, : self.history_patch_count - 1] = -100
+        labels[:, : self.history_patch_count - 1] = -100
         return input_ids, labels
 
     def token_lm_loss(self, input_ids, labels):
