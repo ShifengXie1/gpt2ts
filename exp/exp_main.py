@@ -353,8 +353,6 @@ class Exp_Main(Exp_Basic):
 
         view_dir = os.path.join(save_dir, view_name)
         os.makedirs(view_dir, exist_ok=True)
-        np.save(os.path.join(view_dir, f"{file_prefix}_pred.npy"), pred_batch)
-        np.save(os.path.join(view_dir, f"{file_prefix}_true.npy"), true_batch)
 
         fig, axes = plt.subplots(
             sample_count,
@@ -377,6 +375,23 @@ class Exp_Main(Exp_Basic):
         fig.savefig(os.path.join(view_dir, f"{file_prefix}_prediction_vs_true.png"), dpi=160)
         plt.close(fig)
 
+    def _save_batch_curve_views_from_files(self, save_dir):
+        pred_path = os.path.join(save_dir, "pred.npy")
+        true_path = os.path.join(save_dir, "true.npy")
+        pred_all = np.load(pred_path)
+        true_all = np.load(true_path)
+        batch_size = max(int(self.args.batch_size), 1)
+
+        for batch_idx, start in enumerate(range(0, pred_all.shape[0], batch_size)):
+            end = min(start + batch_size, pred_all.shape[0])
+            self._save_batch_curve_view(
+                pred_all[start:end],
+                true_all[start:end],
+                save_dir,
+                view_name="batch_view",
+                file_prefix=f"batch_{batch_idx:04d}",
+            )
+
     def test(self, setting):
         _, test_loader = self._get_data(flag="test")
         criterion = self._select_criterion()
@@ -386,15 +401,8 @@ class Exp_Main(Exp_Basic):
         os.makedirs(save_dir, exist_ok=True)
 
         with torch.no_grad():
-            for batch_idx, batch in enumerate(test_loader):
+            for batch in test_loader:
                 pred, true = self._process_one_batch(batch)
-                self._save_batch_curve_view(
-                    pred,
-                    true,
-                    save_dir,
-                    view_name="batch_view",
-                    file_prefix=f"batch_{batch_idx:04d}",
-                )
                 preds.append(pred.detach())
                 trues.append(true.detach())
 
@@ -410,6 +418,7 @@ class Exp_Main(Exp_Basic):
         np.save(os.path.join(save_dir, "metrics.npy"), np.array([mae, mse, rmse, mape, mspe]))
         np.save(os.path.join(save_dir, "pred.npy"), preds.numpy())
         np.save(os.path.join(save_dir, "true.npy"), trues.numpy())
+        self._save_batch_curve_views_from_files(save_dir)
 
         metrics = {
             "test_loss": test_loss,
