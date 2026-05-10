@@ -329,7 +329,16 @@ class Exp_Main(Exp_Basic):
         return self.model
 
     # Test and save results.
-    def _save_batch_curve_view(self, pred_batch, true_batch, save_dir, max_samples=8, max_channels=8, view_name="batch_view"):
+    def _save_batch_curve_view(
+        self,
+        pred_batch,
+        true_batch,
+        save_dir,
+        max_samples=8,
+        max_channels=8,
+        view_name="batch_view",
+        file_prefix="batch",
+    ):
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
@@ -344,8 +353,8 @@ class Exp_Main(Exp_Basic):
 
         view_dir = os.path.join(save_dir, view_name)
         os.makedirs(view_dir, exist_ok=True)
-        np.save(os.path.join(view_dir, "batch_pred.npy"), pred_batch)
-        np.save(os.path.join(view_dir, "batch_true.npy"), true_batch)
+        np.save(os.path.join(view_dir, f"{file_prefix}_pred.npy"), pred_batch)
+        np.save(os.path.join(view_dir, f"{file_prefix}_true.npy"), true_batch)
 
         fig, axes = plt.subplots(
             sample_count,
@@ -365,7 +374,7 @@ class Exp_Main(Exp_Basic):
 
         fig.suptitle("Test batch prediction vs true", fontsize=12)
         fig.tight_layout()
-        fig.savefig(os.path.join(view_dir, "batch_prediction_vs_true.png"), dpi=160)
+        fig.savefig(os.path.join(view_dir, f"{file_prefix}_prediction_vs_true.png"), dpi=160)
         plt.close(fig)
 
     def test(self, setting):
@@ -373,14 +382,19 @@ class Exp_Main(Exp_Basic):
         criterion = self._select_criterion()
         self.model.eval()
         preds, trues = [], []
-        view_pred, view_true = None, None
+        save_dir = os.path.join(self.results_dir, setting, self.timestamp)
+        os.makedirs(save_dir, exist_ok=True)
 
         with torch.no_grad():
-            for batch in test_loader:
+            for batch_idx, batch in enumerate(test_loader):
                 pred, true = self._process_one_batch(batch)
-                if view_pred is None:
-                    view_pred = pred.detach()
-                    view_true = true.detach()
+                self._save_batch_curve_view(
+                    pred,
+                    true,
+                    save_dir,
+                    view_name="batch_view",
+                    file_prefix=f"batch_{batch_idx:04d}",
+                )
                 preds.append(pred.detach())
                 trues.append(true.detach())
 
@@ -393,13 +407,9 @@ class Exp_Main(Exp_Basic):
         test_loss = criterion(preds, trues).item()
         print("standardized mse: {}, mae: {}".format(mse, mae))
 
-        save_dir = os.path.join(self.results_dir, setting, self.timestamp)
-        os.makedirs(save_dir, exist_ok=True)
         np.save(os.path.join(save_dir, "metrics.npy"), np.array([mae, mse, rmse, mape, mspe]))
         np.save(os.path.join(save_dir, "pred.npy"), preds.numpy())
         np.save(os.path.join(save_dir, "true.npy"), trues.numpy())
-        if view_pred is not None and view_true is not None:
-            self._save_batch_curve_view(view_pred, view_true, save_dir)
 
         metrics = {
             "test_loss": test_loss,
