@@ -238,6 +238,7 @@ class Exp_Main(Exp_Basic):
             fit_start = time.time()
             self.model.eval()
             self.model.fit_patch_token_map(train_data.data_x)
+            self.model.print_patch_token_distribution()
 
             save_dir = os.path.join(self.results_dir, setting, self.timestamp)
             os.makedirs(save_dir, exist_ok=True)

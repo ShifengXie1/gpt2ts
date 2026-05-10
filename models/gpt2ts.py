@@ -504,6 +504,27 @@ class GPT2TS(nn.Module):
         self.dictionary.fit(train_series, self._vocab_weight())
 
     @torch.no_grad()
+    def print_patch_token_distribution(self):
+        if not self.dictionary.ready:
+            raise RuntimeError("Call fit_patch_token_map before printing patch-token distribution.")
+
+        token_ids = self.dictionary.train_patch_token_ids.detach().cpu()
+        unique_ids, counts = torch.unique(token_ids, return_counts=True)
+        order = torch.argsort(counts, descending=True)
+        token_counts = [
+            (int(unique_ids[idx].item()), int(counts[idx].item()))
+            for idx in order
+        ]
+
+        print(
+            "\tPatch-token distribution | total patches: {0} | unique tokens: {1}".format(
+                int(token_ids.numel()),
+                len(token_counts),
+            )
+        )
+        print("\tPatch-token ids/counts:", token_counts)
+
+    @torch.no_grad()
     def save_patch_token_map(self, path):
         self.dictionary.save_npz(path)
 
