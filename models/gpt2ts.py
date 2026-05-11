@@ -535,6 +535,8 @@ class GPT2TS(nn.Module):
         attention_mask = torch.ones_like(input_ids)
         outputs = self.gpt2(input_ids=input_ids, attention_mask=attention_mask)
         logits = outputs.logits
+        allowed_mask = self._allowed_token_mask(logits.device)
+        logits = logits.masked_fill(~allowed_mask.view(1, 1, -1), -torch.inf)
         return F.cross_entropy(
             logits.reshape(-1, logits.shape[-1]).float(),
             labels.reshape(-1),
@@ -551,6 +553,19 @@ class GPT2TS(nn.Module):
     def _concat_patches(self, patches):
         return patches.reshape(patches.shape[0], patches.shape[1] * self.patch_len, self.c_in)[:, : self.pred_len, :]
 
+    def _allowed_token_mask(self, device):
+        allowed_token_ids = torch.unique(self.dictionary.train_patch_token_ids.detach()).to(
+            device=device,
+            dtype=torch.long,
+        )
+        if allowed_token_ids.numel() == 0:
+            raise RuntimeError("No allowed training token ids are available for GPT generation.")
+
+        vocab_size = int(self.gpt2.config.vocab_size)
+        allowed_mask = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+        allowed_mask[allowed_token_ids.clamp(min=0, max=vocab_size - 1)] = True
+        return allowed_mask
+
     @torch.no_grad()
     def _generate_future_tokens(self, history_token_ids):
         max_positions = int(getattr(self.gpt2.config, "n_positions", history_token_ids.shape[1] + self.future_patch_count))
@@ -560,16 +575,7 @@ class GPT2TS(nn.Module):
         if history_token_ids.shape[1] > max_history:
             history_token_ids = history_token_ids[:, -max_history:]
 
-        allowed_token_ids = torch.unique(self.dictionary.train_patch_token_ids.detach()).to(
-            device=history_token_ids.device,
-            dtype=torch.long,
-        )
-        if allowed_token_ids.numel() == 0:
-            raise RuntimeError("No allowed training token ids are available for GPT generation.")
-
-        vocab_size = int(self.gpt2.config.vocab_size)
-        allowed_mask = torch.zeros(vocab_size, dtype=torch.bool, device=history_token_ids.device)
-        allowed_mask[allowed_token_ids.clamp(min=0, max=vocab_size - 1)] = True
+        allowed_mask = self._allowed_token_mask(history_token_ids.device)
 
         generated = history_token_ids
         for _ in range(self.future_patch_count):
