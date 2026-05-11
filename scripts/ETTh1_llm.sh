@@ -47,6 +47,6 @@ for pred_len in "${PRED_LENS[@]}"; do
         --lora_dropout "$LORA_DROPOUT" \
         --gpt_local_path ./gpt \
         --loss mse \
-        --lradj type3 \
+        --lradj none \
         --seed "$SEED"
 done
