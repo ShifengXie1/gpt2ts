@@ -122,6 +122,74 @@ class Exp_Main(Exp_Basic):
         state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
         self.model.load_state_dict(state_dict, strict=False)
 
+    def _token_log_path(self, save_dir):
+        return os.path.join(save_dir, "token_log.txt")
+
+    def _sorted_token_counts(self, token_ids):
+        token_ids = token_ids.detach().cpu().reshape(-1).long()
+        if token_ids.numel() == 0:
+            return []
+        unique_ids, counts = torch.unique(token_ids, return_counts=True)
+        pairs = [
+            (int(token_id.item()), int(count.item()))
+            for token_id, count in zip(unique_ids, counts)
+        ]
+        return sorted(pairs, key=lambda item: (-item[1], item[0]))
+
+    def _write_train_token_log(self, save_dir):
+        if not hasattr(self.model, "dictionary") or not self.model.dictionary.ready:
+            return
+
+        dictionary = self.model.dictionary
+        token_counts = self._sorted_token_counts(dictionary.train_patch_token_ids)
+        allowed_token_count = len(token_counts)
+        random_ce = float(np.log(allowed_token_count)) if allowed_token_count > 0 else float("nan")
+
+        with open(self._token_log_path(save_dir), "w", encoding="utf-8") as file:
+            file.write("[TRAIN]\n")
+            file.write(f"total_train_patches: {int(dictionary.train_patches.shape[0])}\n")
+            file.write(f"unique_train_tokens: {allowed_token_count}\n")
+            file.write(f"allowed_token_count: {allowed_token_count}\n")
+            file.write(f"random_ce_baseline_log_allowed: {random_ce:.4f}\n")
+            file.write(f"patch_len: {int(self.model.patch_len)}\n")
+            file.write(f"history_patch_count: {int(self.model.history_patch_count)}\n")
+            file.write(f"future_patch_count: {int(self.model.future_patch_count)}\n")
+            file.write(f"cluster_num: {int(dictionary.cluster_num)}\n")
+            file.write("\n")
+            file.write("token_counts:\n")
+            file.write("token_id,count\n")
+            for token_id, count in token_counts:
+                file.write(f"{token_id},{count}\n")
+
+    def _write_test_token_log(self, save_dir, token_records):
+        if not token_records:
+            return
+
+        all_future_tokens = [
+            token_id
+            for record in token_records
+            for token_id in record["future_token_ids"]
+        ]
+        total_counts = self._sorted_token_counts(torch.tensor(all_future_tokens, dtype=torch.long))
+
+        with open(self._token_log_path(save_dir), "a", encoding="utf-8") as file:
+            file.write("\n[TEST]\n")
+            file.write("total_generated_token:\n")
+            file.write("token_id,count\n")
+            for token_id, count in total_counts:
+                file.write(f"{token_id},{count}\n")
+
+            for record in token_records:
+                file.write("\n")
+                file.write(f"sample_index: {record['sample_index']}\n")
+                file.write(f"history_token_ids: {record['history_token_ids']}\n")
+                file.write(f"future_token_ids: {record['future_token_ids']}\n")
+                file.write(f"future_unique_count: {record['future_unique_count']}\n")
+                file.write("generated_token:\n")
+                file.write("token_id,count\n")
+                for token_id, count in record["generated_token"]:
+                    file.write(f"{token_id},{count}\n")
+
     def _train_patch_token_lm(self, checkpoint_dir, vali_loader, test_loader):
         if not hasattr(self.model, "build_lm_training_tensors"):
             return False
@@ -243,6 +311,7 @@ class Exp_Main(Exp_Basic):
             save_dir = os.path.join(self.results_dir, setting, self.timestamp)
             os.makedirs(save_dir, exist_ok=True)
             self.model.save_patch_token_map(os.path.join(save_dir, "patch_token_map.npz"))
+            self._write_train_token_log(save_dir)
             dropped_points = int(getattr(self.model.dictionary, "last_dropped_points", 0))
             if dropped_points > 0:
                 print(f"\tPatchify drop_last: dropped {dropped_points} trailing training point(s).")
@@ -400,14 +469,33 @@ class Exp_Main(Exp_Basic):
         criterion = self._select_criterion()
         self.model.eval()
         preds, trues = [], []
+        token_records = []
+        sample_index = 0
         save_dir = os.path.join(self.results_dir, setting, self.timestamp)
         os.makedirs(save_dir, exist_ok=True)
 
         with torch.no_grad():
             for batch in test_loader:
-                pred, true = self._process_one_batch(batch)
+                pred, true, output = self._process_one_batch(batch, return_output=True)
                 preds.append(pred.detach())
                 trues.append(true.detach())
+                aux = output.aux if hasattr(output, "aux") else None
+                if aux is not None and hasattr(aux, "history_token_ids") and hasattr(aux, "future_token_ids"):
+                    history_token_ids = aux.history_token_ids.detach().cpu().long()
+                    future_token_ids = aux.future_token_ids.detach().cpu().long()
+                    for local_idx in range(future_token_ids.shape[0]):
+                        future_tokens = future_token_ids[local_idx]
+                        generated_token = self._sorted_token_counts(future_tokens)
+                        token_records.append(
+                            {
+                                "sample_index": sample_index,
+                                "history_token_ids": history_token_ids[local_idx].tolist(),
+                                "future_token_ids": future_tokens.tolist(),
+                                "future_unique_count": len(generated_token),
+                                "generated_token": generated_token,
+                            }
+                        )
+                        sample_index += 1
 
         preds = torch.cat(preds, dim=0).cpu()
         trues = torch.cat(trues, dim=0).cpu()
@@ -422,6 +510,7 @@ class Exp_Main(Exp_Basic):
         np.save(os.path.join(save_dir, "pred.npy"), preds.numpy())
         np.save(os.path.join(save_dir, "true.npy"), trues.numpy())
         self._save_batch_curve_views_from_files(save_dir)
+        self._write_test_token_log(save_dir, token_records)
 
         metrics = {
             "test_loss": test_loss,
