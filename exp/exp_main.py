@@ -219,7 +219,7 @@ class Exp_Main(Exp_Basic):
 
         model_optim = optim.Adam(trainable_params, lr=self.args.learning_rate, weight_decay=self.args.weight_decay)
         scaler = torch.amp.GradScaler(enabled=self.amp_enabled)
-        best_vali_loss = float("inf")
+        best_token_loss = float("inf")
         patience_counter = 0
 
         print(
@@ -269,9 +269,9 @@ class Exp_Main(Exp_Basic):
                 )
             )
 
-            if vali_loss < best_vali_loss:
-                print(f"\tValidation loss decreased ({best_vali_loss:.6f} --> {vali_loss:.6f}).  Saving model ...")
-                best_vali_loss = vali_loss
+            if train_loss < best_token_loss:
+                print(f"\tToken loss decreased ({best_token_loss:.6f} --> {train_loss:.6f}).  Saving model ...")
+                best_token_loss = train_loss
                 patience_counter = 0
                 self._save_model_checkpoint(checkpoint_path)
             else:
