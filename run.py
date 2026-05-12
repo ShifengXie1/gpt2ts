@@ -29,7 +29,7 @@ def build_args():
     parser.add_argument('--loss', type=str, default='mse', choices=['mse', 'smoothL1'])
     parser.add_argument('--lradj', type=str, default='none', help='learning-rate adjustment policy')
     parser.add_argument('--n_layers', type=int, default=0, help='number of GPT-2 layers to keep; 0 keeps all layers')
-    parser.add_argument('--cluster_num', type=int, default=128, help='number of patch/vocab clusters')
+    parser.add_argument('--cluster_num', type=int, default=1, help='number of patch/vocab clusters')
     parser.add_argument('--cluster_normalize', type=bool, default=False, help='normalize embeddings when assigning clusters')
     parser.add_argument('--cluster_seed', type=int, default=None, help='seed for cluster init and random center mapping')
     parser.add_argument('--patch_match_tol', type=float, default=1e-6, help='tolerance for exact patch lookup before nearest-neighbor fallback')

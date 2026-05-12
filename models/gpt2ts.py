@@ -232,14 +232,13 @@ class PatchTokenDictionary(nn.Module):
             sorted_patch_indices = patch_indices[torch.argsort(self.patch_center_distances[patch_indices])]
             sorted_vocab_indices = vocab_indices[torch.argsort(self.vocab_token_center_distances[vocab_indices])]
 
-            if sorted_patch_indices.numel() == 1:
-                mapped_positions = torch.full((1,), sorted_vocab_indices.numel() // 2, dtype=torch.long, device=token_ids.device)
-            else:
-                patch_positions = torch.arange(sorted_patch_indices.numel(), device=token_ids.device, dtype=torch.float32)
-                mapped_positions = torch.round(
-                    patch_positions * float(sorted_vocab_indices.numel() - 1) / float(sorted_patch_indices.numel() - 1)
-                ).long()
-            token_ids[sorted_patch_indices] = sorted_vocab_indices[mapped_positions]
+            if sorted_vocab_indices.numel() < sorted_patch_indices.numel():
+                raise ValueError(
+                    "Cannot build a one-to-one patch-token map because the mapped GPT vocab cluster "
+                    f"has {sorted_vocab_indices.numel()} token(s), but the patch cluster has "
+                    f"{sorted_patch_indices.numel()} patch(es)."
+                )
+            token_ids[sorted_patch_indices] = sorted_vocab_indices[: sorted_patch_indices.numel()]
         return token_ids
 
     @torch.no_grad()
@@ -322,12 +321,8 @@ class PatchTokenDictionary(nn.Module):
                 continue
 
             sorted_patch_indices = patch_indices[torch.argsort(self.patch_center_distances[patch_indices])]
-            token_cluster_size = int(self.vocab_cluster_sizes[vocab_cluster_id].item())
             token_rank = int(self.vocab_token_ranks[token_id].item())
-            if token_cluster_size <= 1 or sorted_patch_indices.numel() == 1:
-                patch_pos = sorted_patch_indices.numel() // 2
-            else:
-                patch_pos = int(round(token_rank * float(sorted_patch_indices.numel() - 1) / float(token_cluster_size - 1)))
+            patch_pos = min(token_rank, sorted_patch_indices.numel() - 1)
             selected_patch_indices[pos] = sorted_patch_indices[patch_pos]
 
         patches = self.train_patches[selected_patch_indices]
