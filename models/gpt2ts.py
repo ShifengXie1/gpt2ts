@@ -186,7 +186,7 @@ class GPT2TS(nn.Module):
         history_patches = self._patchify_batch(batch_x)
         history_token_ids = self.dictionary.patches_to_token_ids(history_patches)
         future_token_ids = self._generate_future_tokens(history_token_ids)
-        future_patches = self.dictionary.token_ids_to_patches(future_token_ids)
+        future_patches = self.dictionary.token_ids_to_patches(future_token_ids, self._vocab_weight())
         pred = self._concat_patches(future_patches)
         aux = SimpleNamespace(history_token_ids=history_token_ids, future_token_ids=future_token_ids)
         return pred, aux
