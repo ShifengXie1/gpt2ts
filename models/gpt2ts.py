@@ -2,10 +2,25 @@ from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM, LogitsProcessor, LogitsProcessorList
 
 from models.lora import LoRAConv1D
 from models.patch2token import PatchTokenDictionary
+
+
+class ValidTokenLogitsProcessor(LogitsProcessor):
+    def __init__(self, valid_token_ids):
+        self.valid_token_ids = valid_token_ids.detach().reshape(-1).long()
+
+    def __call__(self, input_ids, scores):
+        valid_token_ids = self.valid_token_ids.to(scores.device)
+        valid_token_ids = valid_token_ids[(valid_token_ids >= 0) & (valid_token_ids < scores.shape[-1])]
+        if valid_token_ids.numel() == 0:
+            raise RuntimeError("No valid token ids are available for constrained GPT generation.")
+
+        masked_scores = torch.full_like(scores, torch.finfo(scores.dtype).min)
+        masked_scores[:, valid_token_ids] = scores[:, valid_token_ids]
+        return masked_scores
 
 
 class GPT2TS(nn.Module):
@@ -167,9 +182,13 @@ class GPT2TS(nn.Module):
             history_token_ids = history_token_ids[:, -max_history:]
 
         attention_mask = torch.ones_like(history_token_ids)
+        logits_processor = LogitsProcessorList([
+            ValidTokenLogitsProcessor(self.dictionary.valid_token_ids)
+        ])
         generated = self.gpt2.generate(
             input_ids=history_token_ids,
             attention_mask=attention_mask,
+            logits_processor=logits_processor,
             min_new_tokens=self.future_patch_count,
             max_new_tokens=self.future_patch_count,
             do_sample=False,
