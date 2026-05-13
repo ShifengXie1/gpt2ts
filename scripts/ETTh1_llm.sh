@@ -9,7 +9,7 @@ RESULTS_DIR="./results"
 SEED=42
 
 PRED_LENS=(96)
-LEARNING_RATE=0.00005
+LEARNING_RATE=0.001
 TRAIN_EPOCHS=10
 PATIENCE=3
 SEQ_LEN=720
@@ -47,6 +47,6 @@ for pred_len in "${PRED_LENS[@]}"; do
         --lora_dropout "$LORA_DROPOUT" \
         --gpt_local_path ./gpt \
         --loss mse \
-        --lradj none \
+        --lradj type1 \
         --seed "$SEED"
 done
