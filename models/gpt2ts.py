@@ -2,7 +2,6 @@ from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers import AutoConfig, AutoModelForCausalLM
 
 from models.lora import LoRAConv1D
@@ -131,29 +130,22 @@ class GPT2TS(nn.Module):
             )
 
         max_positions = int(getattr(self.gpt2.config, "n_positions", window_size))
-        if window_size - 1 > max_positions:
+        if window_size > max_positions:
             raise ValueError(
-                f"Token training window length {window_size - 1} exceeds GPT context length {max_positions}."
+                f"Token training window length {window_size} exceeds GPT context length {max_positions}."
             )
 
         step = max(int(getattr(self.configs, "token_train_stride", 1)), 1)
         windows = tokens.unfold(dimension=0, size=window_size, step=step).contiguous()
-        input_ids = windows[:, :-1].contiguous()
-        labels = windows[:, 1:].contiguous()
-        labels[:, : self.history_patch_count - 1] = -100
+        input_ids = windows.contiguous()
+        labels = windows.clone().contiguous()
+        labels[:, : self.history_patch_count] = -100
         return input_ids, labels
 
     def token_lm_loss(self, input_ids, labels):
         attention_mask = torch.ones_like(input_ids)
-        outputs = self.gpt2(input_ids=input_ids, attention_mask=attention_mask)
-        logits = outputs.logits
-        allowed_mask = self._allowed_token_mask(logits.device)
-        logits = logits.masked_fill(~allowed_mask.view(1, 1, -1), -torch.inf)
-        return F.cross_entropy(
-            logits.reshape(-1, logits.shape[-1]).float(),
-            labels.reshape(-1),
-            ignore_index=-100,
-        )
+        outputs = self.gpt2(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        return outputs.loss
 
     def _patchify_batch(self, batch_x):
         if batch_x.shape[1] != self.seq_len:
@@ -165,19 +157,6 @@ class GPT2TS(nn.Module):
     def _concat_patches(self, patches):
         return patches.reshape(patches.shape[0], patches.shape[1] * self.patch_len, self.c_in)[:, : self.pred_len, :]
 
-    def _allowed_token_mask(self, device):
-        allowed_token_ids = torch.unique(self.dictionary.train_patch_token_ids.detach()).to(
-            device=device,
-            dtype=torch.long,
-        )
-        if allowed_token_ids.numel() == 0:
-            raise RuntimeError("No allowed training token ids are available for GPT generation.")
-
-        vocab_size = int(self.gpt2.config.vocab_size)
-        allowed_mask = torch.zeros(vocab_size, dtype=torch.bool, device=device)
-        allowed_mask[allowed_token_ids.clamp(min=0, max=vocab_size - 1)] = True
-        return allowed_mask
-
     @torch.no_grad()
     def _generate_future_tokens(self, history_token_ids):
         max_positions = int(getattr(self.gpt2.config, "n_positions", history_token_ids.shape[1] + self.future_patch_count))
@@ -187,16 +166,16 @@ class GPT2TS(nn.Module):
         if history_token_ids.shape[1] > max_history:
             history_token_ids = history_token_ids[:, -max_history:]
 
-        allowed_mask = self._allowed_token_mask(history_token_ids.device)
-
-        generated = history_token_ids
-        for _ in range(self.future_patch_count):
-            attention_mask = torch.ones_like(generated)
-            outputs = self.gpt2(input_ids=generated, attention_mask=attention_mask)
-            next_logits = outputs.logits[:, -1, :]
-            next_logits = next_logits.masked_fill(~allowed_mask.unsqueeze(0), -torch.inf)
-            next_token_ids = next_logits.argmax(dim=-1, keepdim=True)
-            generated = torch.cat([generated, next_token_ids], dim=1)
+        attention_mask = torch.ones_like(history_token_ids)
+        generated = self.gpt2.generate(
+            input_ids=history_token_ids,
+            attention_mask=attention_mask,
+            min_new_tokens=self.future_patch_count,
+            max_new_tokens=self.future_patch_count,
+            do_sample=False,
+            pad_token_id=getattr(self.gpt2.config, "pad_token_id", None) or getattr(self.gpt2.config, "eos_token_id", 0),
+            eos_token_id=getattr(self.gpt2.config, "eos_token_id", None),
+        )
         return generated[:, -self.future_patch_count :]
 
     @torch.no_grad()
