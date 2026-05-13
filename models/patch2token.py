@@ -4,8 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-KMEANS_TOL = 1e-6
-KMEANS_MAX_ITERS = 100
+FEATURE_EPS = 1e-12
 
 
 class PatchTokenDictionary(nn.Module):
@@ -21,12 +20,14 @@ class PatchTokenDictionary(nn.Module):
         match_tol=1e-6,
     ):
         super().__init__()
-        self.cluster_num = int(cluster_num)
+        self.cluster_num = 1
         self.patch_len = int(patch_len)
         self.c_in = int(c_in)
         self.normalize = bool(normalize)
         self.seed = 0 if seed is None else int(seed)
         self.match_tol = float(match_tol)
+        self.match_alpha = 1.0
+        self.match_beta = 1.0
 
         self.register_buffer("train_patches", torch.empty(0, self.patch_len, self.c_in), persistent=False)
         self.register_buffer("train_patch_features", torch.empty(0, self.patch_len, self.c_in), persistent=False)
@@ -34,13 +35,23 @@ class PatchTokenDictionary(nn.Module):
         self.register_buffer("patch_centers", torch.empty(self.cluster_num, self.patch_len * self.c_in), persistent=False)
         self.register_buffer("patch_cluster_ids", torch.empty(0, dtype=torch.long), persistent=False)
         self.register_buffer("patch_center_distances", torch.empty(0), persistent=False)
+        self.register_buffer("patch_sort_ranks", torch.empty(0, dtype=torch.long), persistent=False)
+        self.register_buffer("patch_center_cosines", torch.empty(0), persistent=False)
+        self.register_buffer("patch_center_distance_norms", torch.empty(0), persistent=False)
         self.register_buffer("vocab_centers", torch.empty(0, 0), persistent=False)
         self.register_buffer("vocab_token_cluster_ids", torch.empty(0, dtype=torch.long), persistent=False)
         self.register_buffer("vocab_token_center_distances", torch.empty(0), persistent=False)
         self.register_buffer("vocab_token_ranks", torch.empty(0, dtype=torch.long), persistent=False)
+        self.register_buffer("vocab_token_center_cosines", torch.empty(0), persistent=False)
+        self.register_buffer("vocab_token_distance_norms", torch.empty(0), persistent=False)
         self.register_buffer("vocab_cluster_sizes", torch.empty(self.cluster_num, dtype=torch.long), persistent=False)
         self.register_buffer("patch_to_vocab_cluster", torch.empty(self.cluster_num, dtype=torch.long), persistent=False)
         self.register_buffer("vocab_to_patch_cluster", torch.empty(self.cluster_num, dtype=torch.long), persistent=False)
+        self.register_buffer("mean_patch_center_distance", torch.tensor(1.0), persistent=False)
+        self.register_buffer("mean_vocab_center_distance", torch.tensor(1.0), persistent=False)
+        self.register_buffer("valid_token_ids", torch.empty(0, dtype=torch.long), persistent=False)
+        self.register_buffer("token_to_patch_indices", torch.empty(0, dtype=torch.long), persistent=False)
+        self.register_buffer("train_patch_match_scores", torch.empty(0), persistent=False)
         self.register_buffer("fitted", torch.tensor(False), persistent=False)
         self.last_exact_match_count = 0
         self.last_total_match_count = 0
@@ -53,6 +64,8 @@ class PatchTokenDictionary(nn.Module):
             and self.train_patches.numel() > 0
             and self.train_patch_features.numel() > 0
             and self.train_patch_token_ids.numel() > 0
+            and self.valid_token_ids.numel() > 0
+            and self.token_to_patch_indices.numel() > 0
         )
 
     def _resize_for_checkpoint(self, state_dict, prefix):
@@ -66,13 +79,23 @@ class PatchTokenDictionary(nn.Module):
             "patch_centers",
             "patch_cluster_ids",
             "patch_center_distances",
+            "patch_sort_ranks",
+            "patch_center_cosines",
+            "patch_center_distance_norms",
             "vocab_centers",
             "vocab_token_cluster_ids",
             "vocab_token_center_distances",
             "vocab_token_ranks",
+            "vocab_token_center_cosines",
+            "vocab_token_distance_norms",
             "vocab_cluster_sizes",
             "patch_to_vocab_cluster",
             "vocab_to_patch_cluster",
+            "mean_patch_center_distance",
+            "mean_vocab_center_distance",
+            "valid_token_ids",
+            "token_to_patch_indices",
+            "train_patch_match_scores",
             "fitted",
         ):
             key = prefix + name
@@ -91,54 +114,88 @@ class PatchTokenDictionary(nn.Module):
             error_msgs,
         )
 
-    def _distance_source(self, x):
-        return F.normalize(x, dim=-1) if self.normalize else x
-
     def _patch_features(self, patches):
         # Data loaders already scale the series; do not standardize each patch again.
         return patches.float()
 
-    @torch.no_grad()
-    def _kmeans(self, x, k, seed):
-        x = x.detach().float().reshape(-1, x.shape[-1])
-        if x.shape[0] == 0:
-            raise ValueError("Cannot run k-means on an empty tensor.")
+    def _pad_patch_features(self, flat_patches, target_dim):
+        if flat_patches.shape[-1] > target_dim:
+            raise ValueError(
+                "Cannot zero-pad patch features because patch dimension "
+                f"{flat_patches.shape[-1]} is larger than token embedding dimension {target_dim}."
+            )
+        if flat_patches.shape[-1] == target_dim:
+            return flat_patches
+        return F.pad(flat_patches, (0, target_dim - flat_patches.shape[-1]))
 
-        generator = torch.Generator(device=x.device)
-        generator.manual_seed(seed)
-        if x.shape[0] >= k:
-            indices = torch.randperm(x.shape[0], generator=generator, device=x.device)[:k]
-        else:
-            indices = torch.randint(0, x.shape[0], (k,), generator=generator, device=x.device)
-        centers = x[indices].clone()
-
-        previous_assign = None
-        for _ in range(KMEANS_MAX_ITERS):
-            distances = torch.cdist(self._distance_source(x), self._distance_source(centers))
-            assign = distances.argmin(dim=-1)
-
-            if previous_assign is not None and torch.equal(assign, previous_assign):
-                break
-
-            new_centers = centers.clone()
-            for cluster_id in range(k):
-                mask = assign == cluster_id
-                if mask.any():
-                    new_centers[cluster_id] = x[mask].mean(dim=0)
-
-            center_shift = (new_centers - centers).abs().max()
-            centers = new_centers
-            if center_shift.item() <= KMEANS_TOL:
-                break
-            previous_assign = assign
-        return centers
+    def _center_stats(self, x, center):
+        center = center.float()
+        distances = (x.float() - center.unsqueeze(0)).norm(dim=-1)
+        mean_distance = distances.mean().clamp_min(FEATURE_EPS)
+        distance_norms = distances / mean_distance
+        cosines = F.cosine_similarity(
+            x.float(),
+            center.unsqueeze(0).expand_as(x).float(),
+            dim=-1,
+            eps=FEATURE_EPS,
+        )
+        return cosines, distances, distance_norms, mean_distance
 
     @torch.no_grad()
-    def _assign_to_centers(self, x, centers):
-        distances = torch.cdist(self._distance_source(x.float()), self._distance_source(centers.float()))
-        cluster_ids = distances.argmin(dim=-1)
-        center_distances = (x.float() - centers[cluster_ids].float()).norm(dim=-1)
-        return cluster_ids, center_distances
+    def _match_patch_stats_to_tokens(self, patch_cosines, patch_distance_norms, token_cosines, token_distance_norms):
+        token_ids = torch.empty(patch_cosines.shape[0], dtype=torch.long, device=patch_cosines.device)
+        match_scores = torch.empty(patch_cosines.shape[0], dtype=patch_cosines.dtype, device=patch_cosines.device)
+        chunk_size = max(int(getattr(self, "token_match_chunk_size", 256)), 1)
+
+        for start in range(0, patch_cosines.shape[0], chunk_size):
+            end = min(start + chunk_size, patch_cosines.shape[0])
+            score = (
+                self.match_alpha * (token_cosines.unsqueeze(0) - patch_cosines[start:end].unsqueeze(1)).abs()
+                + self.match_beta
+                * (token_distance_norms.unsqueeze(0) - patch_distance_norms[start:end].unsqueeze(1)).abs()
+            )
+            best_scores, best_token_ids = score.min(dim=-1)
+            token_ids[start:end] = best_token_ids
+            match_scores[start:end] = best_scores
+
+        return token_ids, match_scores
+
+    @torch.no_grad()
+    def _build_token_to_patch_indices(self, vocab_embeds, train_token_ids, patch_match_scores):
+        vocab_size = vocab_embeds.shape[0]
+        token_to_patch = torch.full((vocab_size,), -1, dtype=torch.long, device=vocab_embeds.device)
+        best_scores = torch.full((vocab_size,), float("inf"), dtype=patch_match_scores.dtype, device=vocab_embeds.device)
+
+        for patch_idx, token_id in enumerate(train_token_ids):
+            token_id = int(token_id.item())
+            score = patch_match_scores[patch_idx]
+            if score < best_scores[token_id]:
+                best_scores[token_id] = score
+                token_to_patch[token_id] = patch_idx
+
+        valid_token_ids = torch.nonzero(token_to_patch >= 0, as_tuple=False).flatten()
+        if valid_token_ids.numel() == 0:
+            raise RuntimeError("No valid patch-token assignments were produced.")
+
+        invalid_token_ids = torch.nonzero(token_to_patch < 0, as_tuple=False).flatten()
+        if invalid_token_ids.numel() > 0:
+            valid_embeds = vocab_embeds[valid_token_ids].float()
+            chunk_size = max(int(getattr(self, "nearest_chunk_size", 256)), 1)
+            for start in range(0, invalid_token_ids.numel(), chunk_size):
+                end = min(start + chunk_size, invalid_token_ids.numel())
+                token_chunk = invalid_token_ids[start:end]
+                distances = torch.cdist(vocab_embeds[token_chunk].float(), valid_embeds)
+                nearest_valid = valid_token_ids[distances.argmin(dim=-1)]
+                token_to_patch[token_chunk] = token_to_patch[nearest_valid]
+
+        return valid_token_ids, token_to_patch
+
+    def _distance_ranks(self, distances):
+        ranks = torch.empty(distances.shape[0], dtype=torch.long, device=distances.device)
+        if distances.numel() == 0:
+            return ranks
+        ranks[torch.argsort(distances)] = torch.arange(distances.numel(), device=distances.device)
+        return ranks
 
     @torch.no_grad()
     def _patchify_series(self, series):
@@ -165,83 +222,59 @@ class PatchTokenDictionary(nn.Module):
         return patches.reshape(-1, self.patch_len, self.c_in)
 
     @torch.no_grad()
-    def _build_vocab_ranks(self, token_cluster_ids, token_distances):
-        vocab_ranks = torch.zeros_like(token_cluster_ids)
-        cluster_sizes = torch.zeros(self.cluster_num, dtype=torch.long, device=token_cluster_ids.device)
-        for cluster_id in range(self.cluster_num):
-            indices = torch.nonzero(token_cluster_ids == cluster_id, as_tuple=False).flatten()
-            cluster_sizes[cluster_id] = indices.numel()
-            if indices.numel() == 0:
-                continue
-            sorted_indices = indices[torch.argsort(token_distances[indices])]
-            vocab_ranks[sorted_indices] = torch.arange(indices.numel(), device=token_cluster_ids.device)
-        return vocab_ranks, cluster_sizes
-
-    @torch.no_grad()
-    def _map_train_patches_to_tokens(self):
-        token_ids = torch.empty(self.train_patches.shape[0], dtype=torch.long, device=self.train_patches.device)
-        non_empty_vocab_clusters = torch.nonzero(self.vocab_cluster_sizes > 0, as_tuple=False).flatten()
-        for patch_cluster_id in range(self.cluster_num):
-            patch_indices = torch.nonzero(self.patch_cluster_ids == patch_cluster_id, as_tuple=False).flatten()
-            if patch_indices.numel() == 0:
-                continue
-
-            vocab_cluster_id = int(self.patch_to_vocab_cluster[patch_cluster_id].item())
-            vocab_indices = torch.nonzero(self.vocab_token_cluster_ids == vocab_cluster_id, as_tuple=False).flatten()
-            if vocab_indices.numel() == 0:
-                if non_empty_vocab_clusters.numel() == 0:
-                    raise RuntimeError("No GPT vocab cluster has assigned tokens.")
-                center = self.vocab_centers[vocab_cluster_id].unsqueeze(0)
-                candidate_centers = self.vocab_centers[non_empty_vocab_clusters]
-                nearest_cluster_pos = torch.cdist(center.float(), candidate_centers.float()).argmin(dim=-1)
-                nearest_cluster_id = non_empty_vocab_clusters[nearest_cluster_pos].item()
-                vocab_indices = torch.nonzero(self.vocab_token_cluster_ids == nearest_cluster_id, as_tuple=False).flatten()
-
-            sorted_patch_indices = patch_indices[torch.argsort(self.patch_center_distances[patch_indices])]
-            sorted_vocab_indices = vocab_indices[torch.argsort(self.vocab_token_center_distances[vocab_indices])]
-
-            if sorted_vocab_indices.numel() < sorted_patch_indices.numel():
-                raise ValueError(
-                    "Cannot build a one-to-one patch-token map because the mapped GPT vocab cluster "
-                    f"has {sorted_vocab_indices.numel()} token(s), but the patch cluster has "
-                    f"{sorted_patch_indices.numel()} patch(es)."
-                )
-            token_ids[sorted_patch_indices] = sorted_vocab_indices[: sorted_patch_indices.numel()]
-        return token_ids
-
-    @torch.no_grad()
     def fit(self, train_series, vocab_embeds):
         train_patches = self._patchify_series(train_series)
         train_patch_features = self._patch_features(train_patches)
         flat_patches = train_patch_features.reshape(train_patch_features.shape[0], -1).float()
         vocab_embeds = vocab_embeds.detach().float().to(flat_patches.device)
 
-        patch_centers = self._kmeans(flat_patches, self.cluster_num, self.seed + 11)
-        patch_cluster_ids, patch_distances = self._assign_to_centers(flat_patches, patch_centers)
+        padded_patches = self._pad_patch_features(flat_patches, vocab_embeds.shape[-1])
+        patch_centers = padded_patches.mean(dim=0, keepdim=True)
+        vocab_centers = vocab_embeds.mean(dim=0, keepdim=True)
 
-        vocab_centers = self._kmeans(vocab_embeds, self.cluster_num, self.seed + 17)
-        vocab_cluster_ids, vocab_distances = self._assign_to_centers(vocab_embeds, vocab_centers)
-        vocab_ranks, vocab_cluster_sizes = self._build_vocab_ranks(vocab_cluster_ids, vocab_distances)
-
-        generator = torch.Generator(device=flat_patches.device)
-        generator.manual_seed(self.seed + 23)
-        patch_to_vocab = torch.randperm(self.cluster_num, generator=generator, device=flat_patches.device)
-        vocab_to_patch = torch.empty_like(patch_to_vocab)
-        vocab_to_patch[patch_to_vocab] = torch.arange(self.cluster_num, device=flat_patches.device)
+        patch_cosines, patch_distances, patch_distance_norms, mean_patch_distance = self._center_stats(
+            padded_patches,
+            patch_centers[0],
+        )
+        vocab_cosines, vocab_distances, vocab_distance_norms, mean_vocab_distance = self._center_stats(
+            vocab_embeds,
+            vocab_centers[0],
+        )
+        train_token_ids, patch_match_scores = self._match_patch_stats_to_tokens(
+            patch_cosines,
+            patch_distance_norms,
+            vocab_cosines,
+            vocab_distance_norms,
+        )
+        valid_token_ids, token_to_patch_indices = self._build_token_to_patch_indices(
+            vocab_embeds,
+            train_token_ids,
+            patch_match_scores,
+        )
 
         self.train_patches = train_patches.detach()
         self.train_patch_features = train_patch_features.detach()
         self.patch_centers = patch_centers.detach()
-        self.patch_cluster_ids = patch_cluster_ids.detach()
+        self.patch_cluster_ids = torch.zeros(flat_patches.shape[0], dtype=torch.long, device=flat_patches.device)
         self.patch_center_distances = patch_distances.detach()
+        self.patch_sort_ranks = self._distance_ranks(patch_distances).detach()
+        self.patch_center_cosines = patch_cosines.detach()
+        self.patch_center_distance_norms = patch_distance_norms.detach()
         self.vocab_centers = vocab_centers.detach()
-        self.vocab_token_cluster_ids = vocab_cluster_ids.detach()
+        self.vocab_token_cluster_ids = torch.zeros(vocab_embeds.shape[0], dtype=torch.long, device=flat_patches.device)
         self.vocab_token_center_distances = vocab_distances.detach()
-        self.vocab_token_ranks = vocab_ranks.detach()
-        self.vocab_cluster_sizes = vocab_cluster_sizes.detach()
-        self.patch_to_vocab_cluster = patch_to_vocab.detach()
-        self.vocab_to_patch_cluster = vocab_to_patch.detach()
-        self.train_patch_token_ids = self._map_train_patches_to_tokens().detach()
+        self.vocab_token_ranks = self._distance_ranks(vocab_distances).detach()
+        self.vocab_token_center_cosines = vocab_cosines.detach()
+        self.vocab_token_distance_norms = vocab_distance_norms.detach()
+        self.vocab_cluster_sizes = torch.tensor([vocab_embeds.shape[0]], dtype=torch.long, device=flat_patches.device)
+        self.patch_to_vocab_cluster = torch.zeros(1, dtype=torch.long, device=flat_patches.device)
+        self.vocab_to_patch_cluster = torch.zeros(1, dtype=torch.long, device=flat_patches.device)
+        self.mean_patch_center_distance = mean_patch_distance.detach()
+        self.mean_vocab_center_distance = mean_vocab_distance.detach()
+        self.valid_token_ids = valid_token_ids.detach()
+        self.token_to_patch_indices = token_to_patch_indices.detach()
+        self.train_patch_match_scores = patch_match_scores.detach()
+        self.train_patch_token_ids = train_token_ids.detach()
         self.fitted.fill_(True)
 
     @torch.no_grad()
@@ -275,23 +308,11 @@ class PatchTokenDictionary(nn.Module):
         if not self.ready:
             raise RuntimeError("PatchTokenDictionary must be fitted before converting tokens to patches.")
 
-        flat_tokens = token_ids.reshape(-1).long().clamp(min=0, max=self.vocab_token_cluster_ids.shape[0] - 1)
-        selected_patch_indices = torch.empty(flat_tokens.shape[0], dtype=torch.long, device=flat_tokens.device)
-
-        for pos, token_id in enumerate(flat_tokens):
-            vocab_cluster_id = int(self.vocab_token_cluster_ids[token_id].item())
-            patch_cluster_id = int(self.vocab_to_patch_cluster[vocab_cluster_id].item())
-            patch_indices = torch.nonzero(self.patch_cluster_ids == patch_cluster_id, as_tuple=False).flatten()
-            if patch_indices.numel() == 0:
-                patch_center = self.patch_centers[patch_cluster_id].unsqueeze(0)
-                train_flat = self.train_patch_features.reshape(self.train_patch_features.shape[0], -1).float()
-                selected_patch_indices[pos] = torch.cdist(patch_center.float(), train_flat).argmin(dim=-1).item()
-                continue
-
-            sorted_patch_indices = patch_indices[torch.argsort(self.patch_center_distances[patch_indices])]
-            token_rank = int(self.vocab_token_ranks[token_id].item())
-            patch_pos = min(token_rank, sorted_patch_indices.numel() - 1)
-            selected_patch_indices[pos] = sorted_patch_indices[patch_pos]
+        flat_tokens = token_ids.reshape(-1).long().to(self.token_to_patch_indices.device)
+        flat_tokens = flat_tokens.clamp(min=0, max=self.token_to_patch_indices.shape[0] - 1)
+        selected_patch_indices = self.token_to_patch_indices[flat_tokens]
+        if (selected_patch_indices < 0).any():
+            raise RuntimeError("Token-to-patch table contains an unmapped token. Refit the patch-token map.")
 
         patches = self.train_patches[selected_patch_indices]
         return patches.reshape(*token_ids.shape, self.patch_len, self.c_in)
@@ -307,13 +328,24 @@ class PatchTokenDictionary(nn.Module):
             patch_centers=self.patch_centers.detach().cpu().numpy(),
             patch_cluster_ids=self.patch_cluster_ids.detach().cpu().numpy(),
             patch_center_distances=self.patch_center_distances.detach().cpu().numpy(),
+            patch_sort_ranks=self.patch_sort_ranks.detach().cpu().numpy(),
+            patch_center_cosines=self.patch_center_cosines.detach().cpu().numpy(),
+            patch_center_distance_norms=self.patch_center_distance_norms.detach().cpu().numpy(),
             vocab_centers=self.vocab_centers.detach().cpu().numpy(),
             vocab_token_cluster_ids=self.vocab_token_cluster_ids.detach().cpu().numpy(),
             vocab_token_center_distances=self.vocab_token_center_distances.detach().cpu().numpy(),
             vocab_token_ranks=self.vocab_token_ranks.detach().cpu().numpy(),
+            vocab_token_center_cosines=self.vocab_token_center_cosines.detach().cpu().numpy(),
+            vocab_token_distance_norms=self.vocab_token_distance_norms.detach().cpu().numpy(),
             vocab_cluster_sizes=self.vocab_cluster_sizes.detach().cpu().numpy(),
             patch_to_vocab_cluster=self.patch_to_vocab_cluster.detach().cpu().numpy(),
             vocab_to_patch_cluster=self.vocab_to_patch_cluster.detach().cpu().numpy(),
+            mean_patch_center_distance=self.mean_patch_center_distance.detach().cpu().numpy(),
+            mean_vocab_center_distance=self.mean_vocab_center_distance.detach().cpu().numpy(),
+            valid_token_ids=self.valid_token_ids.detach().cpu().numpy(),
+            token_to_patch_indices=self.token_to_patch_indices.detach().cpu().numpy(),
+            train_patch_match_scores=self.train_patch_match_scores.detach().cpu().numpy(),
+            map_version=np.array(2),
             cluster_num=np.array(self.cluster_num),
             patch_len=np.array(self.patch_len),
             c_in=np.array(self.c_in),
@@ -327,6 +359,11 @@ class PatchTokenDictionary(nn.Module):
     def load_npz(self, path):
         data = np.load(path)
         device = self.train_patches.device
+        if "token_to_patch_indices" not in data:
+            raise ValueError(
+                "This patch-token map was saved with the old clustering format. "
+                "Refit the patch-token map to use the padded-center mapping."
+            )
         self.cluster_num = int(data["cluster_num"]) if "cluster_num" in data else int(data["patch_centers"].shape[0])
         self.patch_len = int(data["patch_len"]) if "patch_len" in data else self.patch_len
         self.c_in = int(data["c_in"]) if "c_in" in data else self.c_in
@@ -346,6 +383,13 @@ class PatchTokenDictionary(nn.Module):
         self.patch_centers = torch.as_tensor(data["patch_centers"], dtype=torch.float32, device=device)
         self.patch_cluster_ids = torch.as_tensor(data["patch_cluster_ids"], dtype=torch.long, device=device)
         self.patch_center_distances = torch.as_tensor(data["patch_center_distances"], dtype=torch.float32, device=device)
+        self.patch_sort_ranks = torch.as_tensor(data["patch_sort_ranks"], dtype=torch.long, device=device)
+        self.patch_center_cosines = torch.as_tensor(data["patch_center_cosines"], dtype=torch.float32, device=device)
+        self.patch_center_distance_norms = torch.as_tensor(
+            data["patch_center_distance_norms"],
+            dtype=torch.float32,
+            device=device,
+        )
         self.vocab_centers = torch.as_tensor(data["vocab_centers"], dtype=torch.float32, device=device)
         self.vocab_token_cluster_ids = torch.as_tensor(data["vocab_token_cluster_ids"], dtype=torch.long, device=device)
         self.vocab_token_center_distances = torch.as_tensor(
@@ -354,7 +398,30 @@ class PatchTokenDictionary(nn.Module):
             device=device,
         )
         self.vocab_token_ranks = torch.as_tensor(data["vocab_token_ranks"], dtype=torch.long, device=device)
+        self.vocab_token_center_cosines = torch.as_tensor(
+            data["vocab_token_center_cosines"],
+            dtype=torch.float32,
+            device=device,
+        )
+        self.vocab_token_distance_norms = torch.as_tensor(
+            data["vocab_token_distance_norms"],
+            dtype=torch.float32,
+            device=device,
+        )
         self.vocab_cluster_sizes = torch.as_tensor(data["vocab_cluster_sizes"], dtype=torch.long, device=device)
         self.patch_to_vocab_cluster = torch.as_tensor(data["patch_to_vocab_cluster"], dtype=torch.long, device=device)
         self.vocab_to_patch_cluster = torch.as_tensor(data["vocab_to_patch_cluster"], dtype=torch.long, device=device)
+        self.mean_patch_center_distance = torch.as_tensor(
+            data["mean_patch_center_distance"],
+            dtype=torch.float32,
+            device=device,
+        )
+        self.mean_vocab_center_distance = torch.as_tensor(
+            data["mean_vocab_center_distance"],
+            dtype=torch.float32,
+            device=device,
+        )
+        self.valid_token_ids = torch.as_tensor(data["valid_token_ids"], dtype=torch.long, device=device)
+        self.token_to_patch_indices = torch.as_tensor(data["token_to_patch_indices"], dtype=torch.long, device=device)
+        self.train_patch_match_scores = torch.as_tensor(data["train_patch_match_scores"], dtype=torch.float32, device=device)
         self.fitted.fill_(True)
