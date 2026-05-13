@@ -155,22 +155,12 @@ class Exp_Main(Exp_Basic):
             file.write(f"history_patch_count: {int(self.model.history_patch_count)}\n")
             file.write(f"future_patch_count: {int(self.model.future_patch_count)}\n")
             file.write(f"cluster_num: {int(dictionary.cluster_num)}\n")
-            file.write("\n")
-            file.write("token_counts:\n")
-            file.write("token_id,count\n")
-            for token_id, count in token_counts:
-                file.write(f"{token_id},{count}\n")
 
-    def _write_test_token_log(self, save_dir, token_records):
-        if not token_records:
+    def _write_test_token_log(self, save_dir, future_token_ids):
+        if not future_token_ids:
             return
 
-        all_future_tokens = [
-            token_id
-            for record in token_records
-            for token_id in record["future_token_ids"]
-        ]
-        total_counts = self._sorted_token_counts(torch.tensor(all_future_tokens, dtype=torch.long))
+        total_counts = self._sorted_token_counts(torch.tensor(future_token_ids, dtype=torch.long))
 
         with open(self._token_log_path(save_dir), "a", encoding="utf-8") as file:
             file.write("\n[TEST]\n")
@@ -178,17 +168,6 @@ class Exp_Main(Exp_Basic):
             file.write("token_id,count\n")
             for token_id, count in total_counts:
                 file.write(f"{token_id},{count}\n")
-
-            for record in token_records:
-                file.write("\n")
-                file.write(f"sample_index: {record['sample_index']}\n")
-                file.write(f"history_token_ids: {record['history_token_ids']}\n")
-                file.write(f"future_token_ids: {record['future_token_ids']}\n")
-                file.write(f"future_unique_count: {record['future_unique_count']}\n")
-                file.write("generated_token:\n")
-                file.write("token_id,count\n")
-                for token_id, count in record["generated_token"]:
-                    file.write(f"{token_id},{count}\n")
 
     def _train_patch_token_lm(self, checkpoint_dir, vali_loader, test_loader):
         if not hasattr(self.model, "build_lm_training_tensors"):
@@ -469,8 +448,7 @@ class Exp_Main(Exp_Basic):
         criterion = self._select_criterion()
         self.model.eval()
         preds, trues = [], []
-        token_records = []
-        sample_index = 0
+        future_token_ids = []
         save_dir = os.path.join(self.results_dir, setting, self.timestamp)
         os.makedirs(save_dir, exist_ok=True)
 
@@ -480,22 +458,8 @@ class Exp_Main(Exp_Basic):
                 preds.append(pred.detach())
                 trues.append(true.detach())
                 aux = output.aux if hasattr(output, "aux") else None
-                if aux is not None and hasattr(aux, "history_token_ids") and hasattr(aux, "future_token_ids"):
-                    history_token_ids = aux.history_token_ids.detach().cpu().long()
-                    future_token_ids = aux.future_token_ids.detach().cpu().long()
-                    for local_idx in range(future_token_ids.shape[0]):
-                        future_tokens = future_token_ids[local_idx]
-                        generated_token = self._sorted_token_counts(future_tokens)
-                        token_records.append(
-                            {
-                                "sample_index": sample_index,
-                                "history_token_ids": history_token_ids[local_idx].tolist(),
-                                "future_token_ids": future_tokens.tolist(),
-                                "future_unique_count": len(generated_token),
-                                "generated_token": generated_token,
-                            }
-                        )
-                        sample_index += 1
+                if aux is not None and hasattr(aux, "future_token_ids"):
+                    future_token_ids.extend(aux.future_token_ids.detach().cpu().reshape(-1).long().tolist())
 
         preds = torch.cat(preds, dim=0).cpu()
         trues = torch.cat(trues, dim=0).cpu()
@@ -510,7 +474,7 @@ class Exp_Main(Exp_Basic):
         np.save(os.path.join(save_dir, "pred.npy"), preds.numpy())
         np.save(os.path.join(save_dir, "true.npy"), trues.numpy())
         self._save_batch_curve_views_from_files(save_dir)
-        self._write_test_token_log(save_dir, token_records)
+        self._write_test_token_log(save_dir, future_token_ids)
 
         metrics = {
             "test_loss": test_loss,
