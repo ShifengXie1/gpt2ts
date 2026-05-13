@@ -156,18 +156,75 @@ class Exp_Main(Exp_Basic):
             file.write(f"future_patch_count: {int(self.model.future_patch_count)}\n")
             file.write(f"cluster_num: {int(dictionary.cluster_num)}\n")
 
+    def _nearest_used_token_replacements(self, generated_counts):
+        if not hasattr(self.model, "dictionary") or not self.model.dictionary.ready:
+            return [], 0, 0
+        if not hasattr(self.model, "_vocab_weight"):
+            return [], 0, 0
+
+        dictionary = self.model.dictionary
+        valid_token_ids = dictionary.valid_token_ids.detach().cpu().reshape(-1).long()
+        if valid_token_ids.numel() == 0:
+            return [], 0, 0
+
+        valid_token_set = set(valid_token_ids.tolist())
+        generated_items = [(token_id, count) for token_id, count in generated_counts]
+        in_table_count = sum(count for token_id, count in generated_items if token_id in valid_token_set)
+        missing_items = [(token_id, count) for token_id, count in generated_items if token_id not in valid_token_set]
+        if not missing_items:
+            return [], in_table_count, 0
+
+        vocab_embeds = self.model._vocab_weight().detach().float()
+        device = vocab_embeds.device
+        valid_token_ids_device = valid_token_ids.to(device)
+        valid_embeds = vocab_embeds[valid_token_ids_device]
+        missing_token_ids = torch.tensor([token_id for token_id, _ in missing_items], dtype=torch.long, device=device)
+        missing_token_ids = missing_token_ids.clamp(min=0, max=vocab_embeds.shape[0] - 1)
+
+        nearest_used_tokens = torch.empty(missing_token_ids.shape[0], dtype=torch.long, device=device)
+        chunk_size = max(int(getattr(dictionary, "nearest_chunk_size", 256)), 1)
+        with torch.no_grad():
+            for start in range(0, missing_token_ids.shape[0], chunk_size):
+                end = min(start + chunk_size, missing_token_ids.shape[0])
+                distances = torch.cdist(vocab_embeds[missing_token_ids[start:end]], valid_embeds)
+                nearest_used_tokens[start:end] = valid_token_ids_device[distances.argmin(dim=-1)]
+
+        nearest_used_tokens = nearest_used_tokens.detach().cpu().tolist()
+        replacements = [
+            (token_id, int(nearest_token), count)
+            for (token_id, count), nearest_token in zip(missing_items, nearest_used_tokens)
+        ]
+        replacement_count = sum(count for _, _, count in replacements)
+        replacements = sorted(replacements, key=lambda item: (-item[2], item[0], item[1]))
+        return replacements, in_table_count, replacement_count
+
     def _write_test_token_log(self, save_dir, future_token_ids):
         if not future_token_ids:
             return
 
         total_counts = self._sorted_token_counts(torch.tensor(future_token_ids, dtype=torch.long))
+        replacements, in_table_count, replacement_count = self._nearest_used_token_replacements(total_counts)
+        total_generated_count = int(sum(count for _, count in total_counts))
+        generated_unique_tokens = len(total_counts)
+        replacement_unique_tokens = len(replacements)
+        replacement_ratio = replacement_count / total_generated_count if total_generated_count > 0 else 0.0
 
         with open(self._token_log_path(save_dir), "a", encoding="utf-8") as file:
             file.write("\n[TEST]\n")
+            file.write(f"generated_total_count: {total_generated_count}\n")
+            file.write(f"generated_unique_tokens: {generated_unique_tokens}\n")
+            file.write(f"generated_in_table_count: {in_table_count}\n")
+            file.write(f"generated_not_in_table_count: {replacement_count}\n")
+            file.write(f"generated_not_in_table_ratio: {replacement_ratio:.6f}\n")
+            file.write(f"replacement_unique_generated_tokens: {replacement_unique_tokens}\n")
             file.write("total_generated_token:\n")
             file.write("token_id,count\n")
             for token_id, count in total_counts:
                 file.write(f"{token_id},{count}\n")
+            file.write("\nnearest_used_token_replacement:\n")
+            file.write("generated_token,nearest_used_token,count\n")
+            for token_id, nearest_token, count in replacements:
+                file.write(f"{token_id},{nearest_token},{count}\n")
 
     def _train_patch_token_lm(self, checkpoint_dir, vali_loader, test_loader):
         if not hasattr(self.model, "build_lm_training_tensors"):
