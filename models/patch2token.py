@@ -163,7 +163,10 @@ class PatchTokenDictionary(nn.Module):
             score = (
                 self.match_alpha * (token_cosines.unsqueeze(0) - patch_cosines[start:end].unsqueeze(1)).abs()
                 + self.match_beta
-                * (token_center_distances.unsqueeze(0) - target_token_distances.unsqueeze(1)).abs()
+                * (
+                    (token_center_distances.unsqueeze(0) - target_token_distances.unsqueeze(1)).abs()
+                    / mean_token_center_distance.clamp_min(FEATURE_EPS)
+                )
             )
             best_scores, best_token_ids = score.min(dim=-1)
             token_ids[start:end] = best_token_ids
@@ -209,7 +212,11 @@ class PatchTokenDictionary(nn.Module):
         target_token_distance = patch_center_distances[patch_idx] * distance_scale
         return (
             self.match_alpha * (token_cosines[token_id] - patch_cosines[patch_idx]).abs()
-            + self.match_beta * (token_center_distances[token_id] - target_token_distance).abs()
+            + self.match_beta
+            * (
+                (token_center_distances[token_id] - target_token_distance).abs()
+                / mean_token_center_distance.clamp_min(FEATURE_EPS)
+            )
         )
 
     @torch.no_grad()
@@ -260,7 +267,10 @@ class PatchTokenDictionary(nn.Module):
                         self.match_alpha
                         * (token_cosines[unused_token_ids] - patch_cosines[patch_idx]).abs()
                         + self.match_beta
-                        * (token_center_distances[unused_token_ids] - target_token_distance).abs()
+                        * (
+                            (token_center_distances[unused_token_ids] - target_token_distance).abs()
+                            / mean_token_center_distance.clamp_min(FEATURE_EPS)
+                        )
                     )
                     token_id = int(unused_token_ids[score.argmin()].item())
                 used_tokens[token_id] = True

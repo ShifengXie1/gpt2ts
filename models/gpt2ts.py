@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import AutoConfig, AutoModelForCausalLM, LogitsProcessor, LogitsProcessorList
 
 from models.lora import LoRAConv1D
@@ -158,9 +159,47 @@ class GPT2TS(nn.Module):
         return input_ids, labels
 
     def token_lm_loss(self, input_ids, labels):
+        if not self.dictionary.ready:
+            raise RuntimeError("Call fit_patch_token_map before training the token LM.")
+
         attention_mask = torch.ones_like(input_ids)
-        outputs = self.gpt2(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-        return outputs.loss
+        outputs = self.gpt2(input_ids=input_ids, attention_mask=attention_mask)
+        logits = outputs.logits
+
+        valid_token_ids = self.dictionary.valid_token_ids.to(device=logits.device).long()
+        valid_token_ids = valid_token_ids[(valid_token_ids >= 0) & (valid_token_ids < logits.shape[-1])]
+        if valid_token_ids.numel() == 0:
+            raise RuntimeError("No valid token ids are available for masked token LM training.")
+
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].to(device=logits.device, dtype=torch.long).contiguous()
+        active_positions = shift_labels != -100
+        if not bool(active_positions.any().item()):
+            raise RuntimeError("No active labels are available for token LM training.")
+
+        active_labels = shift_labels[active_positions]
+        if bool(((active_labels < 0) | (active_labels >= logits.shape[-1])).any().item()):
+            raise RuntimeError("Token LM labels contain ids outside the GPT vocabulary.")
+
+        label_to_valid_index = torch.full(
+            (logits.shape[-1],),
+            -100,
+            dtype=torch.long,
+            device=logits.device,
+        )
+        label_to_valid_index[valid_token_ids] = torch.arange(valid_token_ids.numel(), device=logits.device)
+
+        remapped_labels = torch.full_like(shift_labels, -100)
+        remapped_labels[active_positions] = label_to_valid_index[active_labels]
+        if bool((remapped_labels[active_positions] < 0).any().item()):
+            raise RuntimeError("Token LM labels contain ids outside the valid patch-token set.")
+
+        valid_logits = shift_logits.index_select(dim=-1, index=valid_token_ids).contiguous()
+        return F.cross_entropy(
+            valid_logits.view(-1, valid_logits.shape[-1]),
+            remapped_labels.view(-1),
+            ignore_index=-100,
+        )
 
     def _patchify_batch(self, batch_x):
         if batch_x.shape[1] != self.seq_len:
