@@ -17,7 +17,7 @@ class PatchTokenDictionary(nn.Module):
         c_in,
         normalize=True,
         seed=0,
-        match_tol=1e-6,
+        match_tol=0.001,
     ):
         super().__init__()
         self.cluster_num = 1
@@ -139,17 +139,31 @@ class PatchTokenDictionary(nn.Module):
         return cosines, distances, distance_norms, mean_distance
 
     @torch.no_grad()
-    def _match_patch_stats_to_tokens(self, patch_cosines, patch_distance_norms, token_cosines, token_distance_norms):
-        token_ids = torch.empty(patch_cosines.shape[0], dtype=torch.long, device=patch_cosines.device)
-        match_scores = torch.empty(patch_cosines.shape[0], dtype=patch_cosines.dtype, device=patch_cosines.device)
+    def _match_patch_stats_to_tokens(
+        self,
+        patch_cosines,
+        patch_center_distances,
+        mean_patch_center_distance,
+        token_cosines,
+        token_center_distances,
+        mean_token_center_distance,
+    ):
+        token_ids = torch.empty(patch_center_distances.shape[0], dtype=torch.long, device=patch_center_distances.device)
+        match_scores = torch.empty(
+            patch_center_distances.shape[0],
+            dtype=patch_center_distances.dtype,
+            device=patch_center_distances.device,
+        )
         chunk_size = max(int(getattr(self, "token_match_chunk_size", 256)), 1)
+        distance_scale = mean_token_center_distance / mean_patch_center_distance.clamp_min(FEATURE_EPS)
 
-        for start in range(0, patch_cosines.shape[0], chunk_size):
-            end = min(start + chunk_size, patch_cosines.shape[0])
+        for start in range(0, patch_center_distances.shape[0], chunk_size):
+            end = min(start + chunk_size, patch_center_distances.shape[0])
+            target_token_distances = patch_center_distances[start:end] * distance_scale
             score = (
                 self.match_alpha * (token_cosines.unsqueeze(0) - patch_cosines[start:end].unsqueeze(1)).abs()
                 + self.match_beta
-                * (token_distance_norms.unsqueeze(0) - patch_distance_norms[start:end].unsqueeze(1)).abs()
+                * (token_center_distances.unsqueeze(0) - target_token_distances.unsqueeze(1)).abs()
             )
             best_scores, best_token_ids = score.min(dim=-1)
             token_ids[start:end] = best_token_ids
@@ -180,10 +194,22 @@ class PatchTokenDictionary(nn.Module):
             return best_index
         return None
 
-    def _patch_token_score(self, patch_idx, token_id, patch_cosines, patch_distance_norms, token_cosines, token_distance_norms):
+    def _patch_token_score(
+        self,
+        patch_idx,
+        token_id,
+        patch_cosines,
+        patch_center_distances,
+        mean_patch_center_distance,
+        token_cosines,
+        token_center_distances,
+        mean_token_center_distance,
+    ):
+        distance_scale = mean_token_center_distance / mean_patch_center_distance.clamp_min(FEATURE_EPS)
+        target_token_distance = patch_center_distances[patch_idx] * distance_scale
         return (
             self.match_alpha * (token_cosines[token_id] - patch_cosines[patch_idx]).abs()
-            + self.match_beta * (token_distance_norms[token_id] - patch_distance_norms[patch_idx]).abs()
+            + self.match_beta * (token_center_distances[token_id] - target_token_distance).abs()
         )
 
     @torch.no_grad()
@@ -192,19 +218,28 @@ class PatchTokenDictionary(nn.Module):
         flat_patches,
         vocab_embeds,
         patch_cosines,
-        patch_distance_norms,
+        patch_center_distances,
+        mean_patch_center_distance,
         token_cosines,
-        token_distance_norms,
+        token_center_distances,
+        mean_token_center_distance,
     ):
         best_token_ids, _ = self._match_patch_stats_to_tokens(
             patch_cosines,
-            patch_distance_norms,
+            patch_center_distances,
+            mean_patch_center_distance,
             token_cosines,
-            token_distance_norms,
+            token_center_distances,
+            mean_token_center_distance,
         )
         train_token_ids = torch.empty(flat_patches.shape[0], dtype=torch.long, device=flat_patches.device)
-        patch_match_scores = torch.empty(flat_patches.shape[0], dtype=patch_cosines.dtype, device=flat_patches.device)
+        patch_match_scores = torch.empty(
+            flat_patches.shape[0],
+            dtype=patch_center_distances.dtype,
+            device=flat_patches.device,
+        )
         used_tokens = torch.zeros(vocab_embeds.shape[0], dtype=torch.bool, device=flat_patches.device)
+        distance_scale = mean_token_center_distance / mean_patch_center_distance.clamp_min(FEATURE_EPS)
 
         for patch_idx in range(flat_patches.shape[0]):
             matching_patch_idx = self._find_prior_matching_patch(flat_patches, patch_idx)
@@ -220,11 +255,14 @@ class PatchTokenDictionary(nn.Module):
                         raise RuntimeError(
                             "Cannot assign unique tokens because all GPT vocab tokens are already used."
                         )
-                    distances = torch.cdist(
-                        vocab_embeds[best_token_id].float().unsqueeze(0),
-                        vocab_embeds[unused_token_ids].float(),
-                    ).squeeze(0)
-                    token_id = int(unused_token_ids[distances.argmin()].item())
+                    target_token_distance = patch_center_distances[patch_idx] * distance_scale
+                    score = (
+                        self.match_alpha
+                        * (token_cosines[unused_token_ids] - patch_cosines[patch_idx]).abs()
+                        + self.match_beta
+                        * (token_center_distances[unused_token_ids] - target_token_distance).abs()
+                    )
+                    token_id = int(unused_token_ids[score.argmin()].item())
                 used_tokens[token_id] = True
 
             train_token_ids[patch_idx] = token_id
@@ -232,9 +270,11 @@ class PatchTokenDictionary(nn.Module):
                 patch_idx,
                 token_id,
                 patch_cosines,
-                patch_distance_norms,
+                patch_center_distances,
+                mean_patch_center_distance,
                 token_cosines,
-                token_distance_norms,
+                token_center_distances,
+                mean_token_center_distance,
             )
 
         valid_token_ids = torch.nonzero(used_tokens, as_tuple=False).flatten()
@@ -296,9 +336,11 @@ class PatchTokenDictionary(nn.Module):
             flat_patches,
             vocab_embeds,
             patch_cosines,
-            patch_distance_norms,
+            patch_distances,
+            mean_patch_distance,
             vocab_cosines,
-            vocab_distance_norms,
+            vocab_distances,
+            mean_vocab_distance,
         )
 
         self.train_patches = train_patches.detach()
