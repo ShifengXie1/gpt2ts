@@ -63,16 +63,25 @@ class Exp_Main(Exp_Basic):
             return pred, target, output
         return pred, target
 
-    # Evaluate a split.
-    def vali(self, vali_loader):
+    def _evaluate_loader(self, data_loader, collect_tokens=False):
         self.model.eval()
         preds, trues = [], []
+        token_ce_losses = []
+        future_token_ids = []
 
         with torch.no_grad():
-            for batch in vali_loader:
-                pred, true = self._process_one_batch(batch)
-                preds.append(pred)
-                trues.append(true)     
+            for batch in data_loader:
+                pred, true, output = self._process_one_batch(batch, return_output=True)
+                preds.append(pred.detach())
+                trues.append(true.detach())
+                batch_x = batch[0].to(dtype=torch.float, device=self.device)
+                target = batch[1].to(dtype=torch.float, device=self.device)
+                if hasattr(self.model, "eval_token_ce"):
+                    token_ce_losses.append(self.model.eval_token_ce(batch_x, target))
+                if collect_tokens:
+                    aux = output.aux if hasattr(output, "aux") else None
+                    if aux is not None and hasattr(aux, "future_token_ids"):
+                        future_token_ids.extend(aux.future_token_ids.detach().cpu().reshape(-1).long().tolist())
 
             preds = torch.cat(preds, dim=0).cpu()
             trues = torch.cat(trues, dim=0).cpu()
@@ -81,7 +90,24 @@ class Exp_Main(Exp_Basic):
 
             mae, mse, rmse, mape, mspe = metric(preds.numpy(), trues.numpy())
             self.model.train()
-            return mse, mae
+            finite_token_ce = [value for value in token_ce_losses if not np.isnan(value)]
+            token_ce = float(np.mean(finite_token_ce)) if finite_token_ce else float("nan")
+            return {
+                "mse": mse,
+                "mae": mae,
+                "rmse": rmse,
+                "mape": mape,
+                "mspe": mspe,
+                "token_ce": token_ce,
+                "preds": preds,
+                "trues": trues,
+                "future_token_ids": future_token_ids,
+            }
+
+    # Evaluate a split.
+    def vali(self, vali_loader):
+        results = self._evaluate_loader(vali_loader)
+        return results["mse"], results["mae"]
 
     def _save_model_checkpoint(self, checkpoint_path):
         trainable_names = {name for name, param in self.model.named_parameters() if param.requires_grad}
@@ -96,12 +122,16 @@ class Exp_Main(Exp_Basic):
             "model_config": vars(self.args).copy(),
             "trainable_param_names": sorted(trainable_names),
         }
+        if hasattr(self.model, "dictionary") and hasattr(self.model.dictionary, "state_payload"):
+            checkpoint["patch_token_dictionary"] = self.model.dictionary.state_payload()
         torch.save(checkpoint, checkpoint_path)
 
     def _load_model_checkpoint(self, checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
         self.model.load_state_dict(state_dict, strict=False)
+        if isinstance(checkpoint, dict) and "patch_token_dictionary" in checkpoint:
+            self.model.dictionary.load_state_payload(checkpoint["patch_token_dictionary"])
 
     def _token_log_path(self, save_dir):
         return os.path.join(save_dir, "token_log.txt")
@@ -133,8 +163,14 @@ class Exp_Main(Exp_Basic):
             file.write(f"allowed_token_count: {allowed_token_count}\n")
             if hasattr(dictionary, "valid_token_ids"):
                 file.write(f"valid_token_ids: {int(dictionary.valid_token_ids.numel())}\n")
+            if hasattr(dictionary, "candidate_token_ids"):
+                file.write(f"candidate_token_ids: {int(dictionary.candidate_token_ids.numel())}\n")
             if hasattr(dictionary, "motif_token_ids"):
                 file.write(f"motif_token_ids: {int(dictionary.motif_token_ids.numel())}\n")
+            if hasattr(dictionary, "patch_bank"):
+                file.write(f"patch_bank_shape: {tuple(dictionary.patch_bank.shape)}\n")
+            if hasattr(dictionary, "last_assignment_method"):
+                file.write(f"assignment_method: {dictionary.last_assignment_method}\n")
             file.write(f"random_ce_baseline_log_allowed: {random_ce:.4f}\n")
             file.write(f"patch_len: {int(self.model.patch_len)}\n")
             if hasattr(self.model, "stride"):
@@ -180,8 +216,14 @@ class Exp_Main(Exp_Basic):
             self._save_model_checkpoint(checkpoint_path)
             return False
 
-        input_ids, labels = self.model.build_lm_training_tensors()
-        dataset = TensorDataset(input_ids.detach().cpu(), labels.detach().cpu())
+        training_tensors = self.model.build_lm_training_tensors()
+        dataset = TensorDataset(
+            training_tensors.input_ids.detach().cpu(),
+            training_tensors.labels.detach().cpu(),
+            training_tensors.future_patches.detach().cpu(),
+            training_tensors.align_patches.detach().cpu(),
+            training_tensors.align_candidate_indices.detach().cpu(),
+        )
         token_batch_size = int(getattr(self.args, "token_batch_size", self.args.batch_size) or self.args.batch_size)
         token_loader = DataLoader(
             dataset,
@@ -193,59 +235,112 @@ class Exp_Main(Exp_Basic):
 
         model_optim = optim.Adam(trainable_params, lr=self.args.learning_rate, weight_decay=self.args.weight_decay)
         scaler = torch.amp.GradScaler(enabled=self.amp_enabled)
-        best_token_loss = float("inf")
+        best_vali_mse = float("inf")
         patience_counter = 0
 
         print(
                 "\tToken LM training windows: {0} | input tokens: {1} | future labels/window: {2}".format(
                     len(dataset),
-                    input_ids.shape[1],
+                    training_tensors.input_ids.shape[1],
                     getattr(self.model, "generated_patch_count", self.model.future_patch_count),
                 )
             )
 
         for epoch in range(self.args.train_epochs):
-            token_losses = []
+            loss_sums = {
+                "total_loss": 0.0,
+                "ce_loss": 0.0,
+                "mse_loss": 0.0,
+                "align_loss": 0.0,
+                "smooth_loss": 0.0,
+                "patch_mse": 0.0,
+                "sequence_mse": 0.0,
+            }
+            sample_count = 0
             self.model.train()
             epoch_time = time.time()
 
-            for batch_input_ids, batch_labels in token_loader:
+            for batch_input_ids, batch_labels, batch_future_patches, batch_align_patches, batch_align_indices in token_loader:
                 batch_input_ids = batch_input_ids.to(device=self.device, dtype=torch.long)
                 batch_labels = batch_labels.to(device=self.device, dtype=torch.long)
+                batch_future_patches = batch_future_patches.to(device=self.device, dtype=torch.float)
+                batch_align_patches = batch_align_patches.to(device=self.device, dtype=torch.float)
+                batch_align_indices = batch_align_indices.to(device=self.device, dtype=torch.long)
 
                 model_optim.zero_grad(set_to_none=True)
                 if self.amp_enabled:
                     with torch.amp.autocast(device_type=self.device.type, enabled=self.amp_enabled):
-                        loss = self.model.token_lm_loss(batch_input_ids, batch_labels)
-                    scaler.scale(loss).backward()
+                        losses = self.model.joint_training_loss(
+                            batch_input_ids,
+                            batch_labels,
+                            batch_future_patches,
+                            batch_align_patches,
+                            batch_align_indices,
+                        )
+                    scaler.scale(losses.total_loss).backward()
                     scaler.step(model_optim)
                     scaler.update()
                 else:
-                    loss = self.model.token_lm_loss(batch_input_ids, batch_labels)
-                    loss.backward()
+                    losses = self.model.joint_training_loss(
+                        batch_input_ids,
+                        batch_labels,
+                        batch_future_patches,
+                        batch_align_patches,
+                        batch_align_indices,
+                    )
+                    losses.total_loss.backward()
                     model_optim.step()
 
-                token_losses.append(loss.detach().item())
+                batch_size = int(batch_input_ids.shape[0])
+                sample_count += batch_size
+                loss_sums["total_loss"] += float(losses.total_loss.detach().cpu().item()) * batch_size
+                loss_sums["ce_loss"] += float(losses.loss_ce.detach().cpu().item()) * batch_size
+                loss_sums["mse_loss"] += float(losses.loss_mse.detach().cpu().item()) * batch_size
+                loss_sums["align_loss"] += float(losses.loss_align.detach().cpu().item()) * batch_size
+                loss_sums["smooth_loss"] += float(losses.loss_smooth.detach().cpu().item()) * batch_size
+                loss_sums["patch_mse"] += float(losses.patch_mse.detach().cpu().item()) * batch_size
+                loss_sums["sequence_mse"] += float(losses.sequence_mse.detach().cpu().item()) * batch_size
 
-            train_loss = float(np.mean(token_losses)) if token_losses else float("nan")
-            vali_loss, vali_mae = self.vali(vali_loader)
-            test_loss, test_mae = self.vali(test_loader)
+            train_metrics = {
+                key: value / max(sample_count, 1)
+                for key, value in loss_sums.items()
+            }
+            vali_metrics = self._evaluate_loader(vali_loader)
+            test_metrics = self._evaluate_loader(test_loader)
 
-            if test_loss < self.min_test_loss:
-                self.min_test_loss = test_loss
-                self.min_test_mae = test_mae
+            if test_metrics["mse"] < self.min_test_loss:
+                self.min_test_loss = test_metrics["mse"]
+                self.min_test_mae = test_metrics["mae"]
                 self.epoch_for_min_test_loss = epoch
 
             print("Token Epoch {}: cost time: {:.2f} sec".format(epoch + 1, time.time() - epoch_time))
             print(
-                "\tEpoch {0}: Steps- {1} | Token Loss: {2:.5f} Vali.MSE: {3:.5f} Vali.MAE: {4:.5f} Test.MSE: {5:.5f} Test.MAE: {6:.5f}".format(
-                    epoch + 1, len(token_loader), train_loss, vali_loss, vali_mae, test_loss, test_mae
+                "\tEpoch {0}: Steps- {1} | Total: {2:.5f} CE: {3:.5f} MSE: {4:.5f} Align: {5:.5f} Smooth: {6:.5f}".format(
+                    epoch + 1,
+                    len(token_loader),
+                    train_metrics["total_loss"],
+                    train_metrics["ce_loss"],
+                    train_metrics["mse_loss"],
+                    train_metrics["align_loss"],
+                    train_metrics["smooth_loss"],
+                )
+            )
+            print(
+                "\tPatchMSE: {0:.5f} SeqMSE: {1:.5f} | Vali.CE: {2:.5f} Vali.MSE: {3:.5f} Vali.MAE: {4:.5f} Test.MSE: {5:.5f} Test.MAE: {6:.5f} Best.Vali.MSE: {7:.5f}".format(
+                    train_metrics["patch_mse"],
+                    train_metrics["sequence_mse"],
+                    vali_metrics["token_ce"],
+                    vali_metrics["mse"],
+                    vali_metrics["mae"],
+                    test_metrics["mse"],
+                    test_metrics["mae"],
+                    min(best_vali_mse, vali_metrics["mse"]),
                 )
             )
 
-            if train_loss < best_token_loss:
-                print(f"\tToken loss decreased ({best_token_loss:.6f} --> {train_loss:.6f}).  Saving model ...")
-                best_token_loss = train_loss
+            if vali_metrics["mse"] < best_vali_mse:
+                print(f"\tVali.MSE decreased ({best_vali_mse:.6f} --> {vali_metrics['mse']:.6f}).  Saving model ...")
+                best_vali_mse = vali_metrics["mse"]
                 patience_counter = 0
                 self._save_model_checkpoint(checkpoint_path)
             else:
@@ -254,8 +349,8 @@ class Exp_Main(Exp_Basic):
                 if patience_counter >= self.args.patience:
                     print("\tEarly stopping")
                     break
-            if np.isnan(train_loss):
-                print("\tStopping: token-loss-nan")
+            if np.isnan(train_metrics["total_loss"]):
+                print("\tStopping: total-loss-nan")
                 break
 
             adjust_learning_rate(model_optim, None, epoch + 1, self.args)
@@ -285,6 +380,9 @@ class Exp_Main(Exp_Basic):
             os.makedirs(save_dir, exist_ok=True)
             self.model.save_patch_token_map(os.path.join(save_dir, "patch_token_map.npz"))
             self._write_train_token_log(save_dir)
+            if getattr(self.args, "debug_token_map", False) and hasattr(self.model, "debug_token_map"):
+                for line in self.model.debug_token_map():
+                    print(f"\t{line}")
             dropped_points = int(getattr(self.model.dictionary, "last_dropped_points", 0))
             if dropped_points > 0:
                 print(f"\tPatchify drop_last: dropped {dropped_points} trailing training point(s).")
@@ -379,27 +477,17 @@ class Exp_Main(Exp_Basic):
 
     def test(self, setting):
         _, test_loader = self._get_data(flag="test")
-        self.model.eval()
-        preds, trues = [], []
-        future_token_ids = []
         save_dir = os.path.join(self.results_dir, setting, self.timestamp)
         os.makedirs(save_dir, exist_ok=True)
 
-        with torch.no_grad():
-            for batch in test_loader:
-                pred, true, output = self._process_one_batch(batch, return_output=True)
-                preds.append(pred.detach())
-                trues.append(true.detach())
-                aux = output.aux if hasattr(output, "aux") else None
-                if aux is not None and hasattr(aux, "future_token_ids"):
-                    future_token_ids.extend(aux.future_token_ids.detach().cpu().reshape(-1).long().tolist())
-
-        preds = torch.cat(preds, dim=0).cpu()
-        trues = torch.cat(trues, dim=0).cpu()
-        preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])
-        trues = trues.reshape(-1, trues.shape[-2], trues.shape[-1])
-
-        mae, mse, rmse, mape, mspe = metric(preds.numpy(), trues.numpy())
+        results = self._evaluate_loader(test_loader, collect_tokens=True)
+        preds = results["preds"]
+        trues = results["trues"]
+        mae = results["mae"]
+        mse = results["mse"]
+        rmse = results["rmse"]
+        mape = results["mape"]
+        mspe = results["mspe"]
         test_loss = mse
         print("standardized mse: {}, mae: {}".format(mse, mae))
 
@@ -407,7 +495,7 @@ class Exp_Main(Exp_Basic):
         np.save(os.path.join(save_dir, "pred.npy"), preds.numpy())
         np.save(os.path.join(save_dir, "true.npy"), trues.numpy())
         self._save_batch_curve_views_from_files(save_dir)
-        self._write_test_token_log(save_dir, future_token_ids)
+        self._write_test_token_log(save_dir, results["future_token_ids"])
 
         metrics = {
             "test_loss": test_loss,

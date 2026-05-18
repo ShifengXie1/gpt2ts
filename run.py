@@ -7,6 +7,17 @@ from exp.exp_main import Exp_Main
 from utils.tools import set_random_seed
 
 
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = str(value).lower()
+    if value in ("yes", "true", "t", "1", "y"):
+        return True
+    if value in ("no", "false", "f", "0", "n"):
+        return False
+    raise argparse.ArgumentTypeError("Boolean value expected.")
+
+
 def build_args():
     parser = argparse.ArgumentParser()
     
@@ -28,8 +39,23 @@ def build_args():
     parser.add_argument('--cluster_normalize', type=bool, default=False, help='z-normalize each patch before motif clustering')
     parser.add_argument('--cluster_seed', type=int, default=None, help='seed for motif clustering')
     parser.add_argument('--kmeans_iters', type=int, default=30, help='k-means iterations for historical patch motif clustering')
-    parser.add_argument('--candidate_token_count', type=int, default=0, help='number of GPT vocab tokens available for motif assignment; 0 uses all non-special tokens')
+    parser.add_argument('--candidate_token_count', type=int, default=0, help='legacy candidate pool size used only when candidate_token_num <= 0')
+    parser.add_argument('--candidate_token_num', type=int, default=4096, help='filtered GPT vocab candidate pool size')
+    parser.add_argument('--patch_bank_topk', type=int, default=8, help='top-k real patches stored for each motif')
+    parser.add_argument('--assignment_method', type=str, default='hungarian', choices=['hungarian', 'greedy'])
     parser.add_argument('--token_train_stride', type=int, default=1, help='stride over train patch-token windows for GPT/LoRA training')
+    parser.add_argument('--use_trainable_patch_projector', type=str2bool, default=True)
+    parser.add_argument('--patch_encoder_dim', type=int, default=256)
+    parser.add_argument('--patch_bank_attn_dim', type=int, default=128)
+    parser.add_argument('--use_patch_bank_attention', type=str2bool, default=True)
+    parser.add_argument('--lambda_ce', type=float, default=0.3)
+    parser.add_argument('--lambda_mse', type=float, default=1.0)
+    parser.add_argument('--lambda_align', type=float, default=0.1)
+    parser.add_argument('--lambda_smooth', type=float, default=0.05)
+    parser.add_argument('--mse_temperature', type=float, default=1.0)
+    parser.add_argument('--align_temperature', type=float, default=1.0)
+    parser.add_argument('--residual_scale', type=float, default=0.1)
+    parser.add_argument('--debug_token_map', action='store_true', default=False)
     parser.add_argument('--lora_r', type=int, default=8, help='LoRA rank for GPT-2 attention projections')
     parser.add_argument('--lora_alpha', type=float, default=16.0, help='LoRA alpha')
     parser.add_argument('--lora_dropout', type=float, default=0.05, help='LoRA dropout')
