@@ -253,7 +253,7 @@ class GPT2TS(nn.Module):
             )
         return patches
 
-    def _concat_patches(self, patches):
+    def _concat_patches(self, patches, history_anchor=None):
         if self.stride == self.patch_len:
             return patches.reshape(patches.shape[0], patches.shape[1] * self.patch_len, self.c_in)[:, : self.pred_len, :]
 
@@ -265,7 +265,19 @@ class GPT2TS(nn.Module):
 
         for patch_idx in range(patches.shape[1]):
             start = patch_idx * self.stride
-            out[:, start:start + self.patch_len, :] += patches[:, patch_idx] * window.view(1, -1, 1)
+            patch = patches[:, patch_idx].clone()
+
+            if patch_idx == 0 and history_anchor is not None:
+                patch = patch - patch[:, :1, :] + history_anchor
+            elif start > 0:
+                overlap_len = min(self.patch_len - self.stride, self.patch_len)
+                if overlap_len > 0:
+                    existing_weight = weight[start:start + overlap_len].clamp_min(1e-6).view(1, -1, 1)
+                    existing = out[:, start:start + overlap_len, :] / existing_weight
+                    offset = (existing - patch[:, :overlap_len, :]).mean(dim=1, keepdim=True)
+                    patch = patch + offset
+
+            out[:, start:start + self.patch_len, :] += patch * window.view(1, -1, 1)
             weight[start:start + self.patch_len] += window
 
         out = out / weight.clamp_min(1e-6).view(1, -1, 1)
@@ -314,7 +326,7 @@ class GPT2TS(nn.Module):
         history_token_ids = self.dictionary.patches_to_token_ids(history_patches)
         future_token_ids = self._generate_future_tokens(history_token_ids)
         future_patches = self.dictionary.token_ids_to_patches(future_token_ids, self._vocab_weight())
-        pred = self._concat_patches(future_patches)
+        pred = self._concat_patches(future_patches, history_anchor=batch_x[:, -1:, :])
         aux = SimpleNamespace(history_token_ids=history_token_ids, future_token_ids=future_token_ids)
         return pred, aux
 

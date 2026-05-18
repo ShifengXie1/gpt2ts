@@ -156,6 +156,8 @@ class Exp_Main(Exp_Basic):
                 file.write(f"motif_token_ids: {int(dictionary.motif_token_ids.numel())}\n")
             file.write(f"random_ce_baseline_log_allowed: {random_ce:.4f}\n")
             file.write(f"patch_len: {int(self.model.patch_len)}\n")
+            if hasattr(self.model, "stride"):
+                file.write(f"stride: {int(self.model.stride)}\n")
             file.write(f"history_patch_count: {int(self.model.history_patch_count)}\n")
             if hasattr(self.model, "boundary_patch_count"):
                 file.write(f"boundary_patch_count: {int(self.model.boundary_patch_count)}\n")
