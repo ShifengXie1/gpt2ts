@@ -150,6 +150,10 @@ class Exp_Main(Exp_Basic):
             file.write(f"total_train_patches: {int(dictionary.train_patches.shape[0])}\n")
             file.write(f"unique_train_tokens: {allowed_token_count}\n")
             file.write(f"allowed_token_count: {allowed_token_count}\n")
+            if hasattr(dictionary, "valid_token_ids"):
+                file.write(f"valid_token_ids: {int(dictionary.valid_token_ids.numel())}\n")
+            if hasattr(dictionary, "motif_token_ids"):
+                file.write(f"motif_token_ids: {int(dictionary.motif_token_ids.numel())}\n")
             file.write(f"random_ce_baseline_log_allowed: {random_ce:.4f}\n")
             file.write(f"patch_len: {int(self.model.patch_len)}\n")
             file.write(f"history_patch_count: {int(self.model.history_patch_count)}\n")

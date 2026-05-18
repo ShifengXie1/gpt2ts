@@ -132,6 +132,13 @@ class GPT2TS(nn.Module):
     @torch.no_grad()
     def fit_patch_token_map(self, train_series):
         self.dictionary.fit(train_series, self._vocab_weight(), self._candidate_token_ids())
+        valid_count = int(self.dictionary.valid_token_ids.numel())
+        if valid_count < 2:
+            raise ValueError(
+                "Patch-token map has fewer than 2 valid GPT tokens. "
+                "Increase --cluster_num; using --cluster_num 1 makes token loss exactly 0 "
+                "and forces every forecast patch to be identical."
+            )
 
     @torch.no_grad()
     def print_patch_token_distribution(self):
@@ -199,6 +206,11 @@ class GPT2TS(nn.Module):
         valid_token_ids = valid_token_ids[(valid_token_ids >= 0) & (valid_token_ids < logits.shape[-1])]
         if valid_token_ids.numel() == 0:
             raise RuntimeError("No valid token ids are available for masked token LM training.")
+        if valid_token_ids.numel() < 2:
+            raise RuntimeError(
+                "Only one valid patch token is available, so cross-entropy is always 0. "
+                "Increase --cluster_num before training."
+            )
 
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = labels[:, 1:].to(device=logits.device, dtype=torch.long).contiguous()
