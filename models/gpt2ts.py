@@ -74,7 +74,6 @@ class GPT2TS(nn.Module):
             stride=self.stride,
             normalize=getattr(configs, "cluster_normalize", False),
             seed=getattr(configs, "cluster_seed", 0),
-            match_tol=getattr(configs, "patch_match_tol", 1e-6),
             kmeans_iters=getattr(configs, "kmeans_iters", 30),
         )
 
@@ -139,27 +138,6 @@ class GPT2TS(nn.Module):
                 "Increase --cluster_num; using --cluster_num 1 makes token loss exactly 0 "
                 "and forces every forecast patch to be identical."
             )
-
-    @torch.no_grad()
-    def print_patch_token_distribution(self):
-        if not self.dictionary.ready:
-            raise RuntimeError("Call fit_patch_token_map before printing patch-token distribution.")
-
-        token_ids = self.dictionary.train_patch_token_ids.detach().cpu()
-        unique_ids, counts = torch.unique(token_ids, return_counts=True)
-        order = torch.argsort(counts, descending=True)
-        token_counts = [
-            (int(unique_ids[idx].item()), int(counts[idx].item()))
-            for idx in order
-        ]
-
-        print(
-            "\tPatch-token distribution | total patches: {0} | unique tokens: {1}".format(
-                int(token_ids.numel()),
-                len(token_counts),
-            )
-        )
-        print("\tPatch-token ids/counts:", token_counts)
 
     @torch.no_grad()
     def save_patch_token_map(self, path):
@@ -325,11 +303,11 @@ class GPT2TS(nn.Module):
         history_patches = self._patchify_batch(batch_x)
         history_token_ids = self.dictionary.patches_to_token_ids(history_patches)
         future_token_ids = self._generate_future_tokens(history_token_ids)
-        future_patches = self.dictionary.token_ids_to_patches(future_token_ids, self._vocab_weight())
+        future_patches = self.dictionary.token_ids_to_patches(future_token_ids)
         pred = self._concat_patches(future_patches, history_anchor=batch_x[:, -1:, :])
         aux = SimpleNamespace(history_token_ids=history_token_ids, future_token_ids=future_token_ids)
         return pred, aux
 
-    def forward(self, batch_x, batch_y=None):
+    def forward(self, batch_x):
         pred, aux = self.forecast(batch_x)
-        return SimpleNamespace(pred=pred, loss=None, aux=aux)
+        return SimpleNamespace(pred=pred, aux=aux)

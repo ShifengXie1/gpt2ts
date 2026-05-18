@@ -11,7 +11,7 @@ from exp.exp_basic import Exp_Basic
 from data_provider.data_factory import data_provider
 from models import gpt2ts
 from utils.metrics import metric
-from utils.tools import EarlyStopping, adjust_learning_rate
+from utils.tools import adjust_learning_rate
 
 
 class Exp_Main(Exp_Basic):
@@ -37,28 +37,10 @@ class Exp_Main(Exp_Basic):
         data_set, data_loader = data_provider(self.args, flag)
         return data_set, data_loader
 
-    # Optimize trainable params only.
-    def _select_optimizer(self):
-        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-        return optim.Adam(trainable_params, lr=self.args.learning_rate, weight_decay=self.args.weight_decay)
-
-    # Select the training loss.
-    def _select_criterion(self):
-        criterions = {"mse": torch.nn.MSELoss(), "smoothL1": torch.nn.SmoothL1Loss()}
-        try:
-            return criterions[self.args.loss]
-        except KeyError as exc:
-            raise ValueError(f"Invalid loss: {self.args.loss}") from exc
-
     # Align prediction horizon and channels.
     def _align_prediction_and_target(self, pred, target):
         pred = pred[:, -self.args.pred_len :, :]
         target = target[:, -self.args.pred_len :, :]
-        if self.args.features == "MS":
-            c_out = int(getattr(self.args, "c_out", target.shape[-1]) or target.shape[-1])
-            if c_out > 0:
-                pred = pred[:, :, -c_out:]
-                target = target[:, :, -c_out:]
         return pred, target
 
     # Process one batch.
@@ -69,13 +51,12 @@ class Exp_Main(Exp_Basic):
         
         batch_x = batch_x.to(dtype=torch.float, device=self.device)
         target = target.to(dtype=torch.float, device=self.device)
-        model_target = target if return_output else None
         
         if self.amp_enabled:
             with torch.amp.autocast(device_type=self.device.type, enabled=self.amp_enabled):
-                output = self.model(batch_x, model_target)
+                output = self.model(batch_x)
         else:
-            output = self.model(batch_x, model_target) 
+            output = self.model(batch_x)
         pred = output.pred if hasattr(output, "pred") else output
         pred, target = self._align_prediction_and_target(pred, target)
         if return_output:
@@ -166,75 +147,22 @@ class Exp_Main(Exp_Basic):
                 file.write(f"generated_patch_count: {int(self.model.generated_patch_count)}\n")
             file.write(f"cluster_num: {int(dictionary.cluster_num)}\n")
 
-    def _nearest_used_token_replacements(self, generated_counts):
-        if not hasattr(self.model, "dictionary") or not self.model.dictionary.ready:
-            return [], 0, 0
-        if not hasattr(self.model, "_vocab_weight"):
-            return [], 0, 0
-
-        dictionary = self.model.dictionary
-        valid_token_ids = dictionary.valid_token_ids.detach().cpu().reshape(-1).long()
-        if valid_token_ids.numel() == 0:
-            return [], 0, 0
-
-        valid_token_set = set(valid_token_ids.tolist())
-        generated_items = [(token_id, count) for token_id, count in generated_counts]
-        in_table_count = sum(count for token_id, count in generated_items if token_id in valid_token_set)
-        missing_items = [(token_id, count) for token_id, count in generated_items if token_id not in valid_token_set]
-        if not missing_items:
-            return [], in_table_count, 0
-
-        vocab_embeds = self.model._vocab_weight().detach().float()
-        device = vocab_embeds.device
-        valid_token_ids_device = valid_token_ids.to(device)
-        valid_embeds = vocab_embeds[valid_token_ids_device]
-        missing_token_ids = torch.tensor([token_id for token_id, _ in missing_items], dtype=torch.long, device=device)
-        missing_token_ids = missing_token_ids.clamp(min=0, max=vocab_embeds.shape[0] - 1)
-
-        nearest_used_tokens = torch.empty(missing_token_ids.shape[0], dtype=torch.long, device=device)
-        chunk_size = max(int(getattr(dictionary, "nearest_chunk_size", 256)), 1)
-        with torch.no_grad():
-            for start in range(0, missing_token_ids.shape[0], chunk_size):
-                end = min(start + chunk_size, missing_token_ids.shape[0])
-                distances = torch.cdist(vocab_embeds[missing_token_ids[start:end]], valid_embeds)
-                nearest_used_tokens[start:end] = valid_token_ids_device[distances.argmin(dim=-1)]
-
-        nearest_used_tokens = nearest_used_tokens.detach().cpu().tolist()
-        replacements = [
-            (token_id, int(nearest_token), count)
-            for (token_id, count), nearest_token in zip(missing_items, nearest_used_tokens)
-        ]
-        replacement_count = sum(count for _, _, count in replacements)
-        replacements = sorted(replacements, key=lambda item: (-item[2], item[0], item[1]))
-        return replacements, in_table_count, replacement_count
-
     def _write_test_token_log(self, save_dir, future_token_ids):
         if not future_token_ids:
             return
 
         total_counts = self._sorted_token_counts(torch.tensor(future_token_ids, dtype=torch.long))
-        replacements, in_table_count, replacement_count = self._nearest_used_token_replacements(total_counts)
         total_generated_count = int(sum(count for _, count in total_counts))
         generated_unique_tokens = len(total_counts)
-        replacement_unique_tokens = len(replacements)
-        replacement_ratio = replacement_count / total_generated_count if total_generated_count > 0 else 0.0
 
         with open(self._token_log_path(save_dir), "a", encoding="utf-8") as file:
             file.write("\n[TEST]\n")
             file.write(f"generated_total_count: {total_generated_count}\n")
             file.write(f"generated_unique_tokens: {generated_unique_tokens}\n")
-            file.write(f"generated_in_table_count: {in_table_count}\n")
-            file.write(f"generated_not_in_table_count: {replacement_count}\n")
-            file.write(f"generated_not_in_table_ratio: {replacement_ratio:.6f}\n")
-            file.write(f"replacement_unique_generated_tokens: {replacement_unique_tokens}\n")
             file.write("total_generated_token:\n")
             file.write("token_id,count\n")
             for token_id, count in total_counts:
                 file.write(f"{token_id},{count}\n")
-            file.write("\nnearest_used_token_replacement:\n")
-            file.write("generated_token,nearest_used_token,count\n")
-            for token_id, nearest_token, count in replacements:
-                file.write(f"{token_id},{nearest_token},{count}\n")
 
     def _train_patch_token_lm(self, checkpoint_dir, vali_loader, test_loader):
         if not hasattr(self.model, "build_lm_training_tensors"):
@@ -338,7 +266,7 @@ class Exp_Main(Exp_Basic):
 
     # Run training and early stopping.
     def train(self, setting):
-        train_data, train_loader = self._get_data(flag="train")
+        train_data, _ = self._get_data(flag="train")
         _, vali_loader = self._get_data(flag="val")
         _, test_loader = self._get_data(flag="test")
 
@@ -352,7 +280,6 @@ class Exp_Main(Exp_Basic):
             fit_start = time.time()
             self.model.eval()
             self.model.fit_patch_token_map(train_data.data_x)
-            # self.model.print_patch_token_distribution()
 
             save_dir = os.path.join(self.results_dir, setting, self.timestamp)
             os.makedirs(save_dir, exist_ok=True)
@@ -383,66 +310,6 @@ class Exp_Main(Exp_Basic):
                 )
             )
             return self.model
-
-        train_steps = len(train_loader)
-        early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
-        model_optim = self._select_optimizer()
-        criterion = self._select_criterion()
-
-        
-        scaler = torch.amp.GradScaler(enabled=self.amp_enabled)
-
-        for epoch in range(self.args.train_epochs):
-            train_loss = []
-            self.model.train()
-            epoch_time = time.time()
-
-            for batch in train_loader:
-                model_optim.zero_grad(set_to_none=True)
-                pred, true, output = self._process_one_batch(batch, return_output=True)
-                main_loss = criterion(pred, true)
-                model_loss = output.loss if hasattr(output, "loss") else None
-                loss = main_loss if model_loss is None else main_loss + model_loss
-
-                if self.amp_enabled:
-                    scaler.scale(loss).backward()
-                    scaler.step(model_optim)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    model_optim.step()
-
-                train_loss.append(loss.detach().item())
-
-            train_loss = float(np.mean(train_loss)) if train_loss else float("nan")
-            vali_loss, vali_mae = self.vali(vali_loader)
-            test_loss, test_mae = self.vali(test_loader)
-
-            if test_loss < self.min_test_loss:
-                self.min_test_loss = test_loss
-                self.min_test_mae = test_mae
-                self.epoch_for_min_test_loss = epoch
-
-            print("Epoch {}: cost time: {:.2f} sec".format(epoch + 1, time.time() - epoch_time))
-            print(
-                "\tEpoch {0}: Steps- {1} | Train Loss: {2:.5f} Vali.MSE: {3:.5f} Vali.MAE: {4:.5f} Test.MSE: {5:.5f} Test.MAE: {6:.5f}".format(
-                    epoch + 1, train_steps, train_loss, vali_loss, vali_mae, test_loss, test_mae
-                )
-            )
-
-            early_stopping(vali_loss, self.model, checkpoint_dir)
-            if early_stopping.early_stop:
-                print("\tEarly stopping")
-                break
-            if np.isnan(train_loss):
-                print("\tStopping: train-loss-nan")
-                break
-
-            adjust_learning_rate(model_optim, None, epoch + 1, self.args)
-
-        best_model_path = os.path.join(checkpoint_dir, "checkpoint.pth")
-        self._load_model_checkpoint(best_model_path)
-        return self.model
 
     # Test and save results.
     def _save_batch_curve_view(
@@ -512,7 +379,6 @@ class Exp_Main(Exp_Basic):
 
     def test(self, setting):
         _, test_loader = self._get_data(flag="test")
-        criterion = self._select_criterion()
         self.model.eval()
         preds, trues = [], []
         future_token_ids = []
@@ -534,7 +400,7 @@ class Exp_Main(Exp_Basic):
         trues = trues.reshape(-1, trues.shape[-2], trues.shape[-1])
 
         mae, mse, rmse, mape, mspe = metric(preds.numpy(), trues.numpy())
-        test_loss = criterion(preds, trues).item()
+        test_loss = mse
         print("standardized mse: {}, mae: {}".format(mse, mae))
 
         np.save(os.path.join(save_dir, "metrics.npy"), np.array([mae, mse, rmse, mape, mspe]))

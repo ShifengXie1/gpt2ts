@@ -17,7 +17,6 @@ BATCH_SIZE=8
 TOKEN_BATCH_SIZE=8
 PATCH_SIZE=8
 STRIDE=4
-N_LAYERS=0
 CLUSTER_NUM=512
 TOKEN_TRAIN_STRIDE=1
 LORA_R=16
@@ -39,14 +38,12 @@ for pred_len in "${PRED_LENS[@]}"; do
         --results_dir "$RESULTS_DIR" \
         --patch_len "$PATCH_SIZE" \
         --stride "$STRIDE" \
-        --n_layers "$N_LAYERS" \
         --cluster_num "$CLUSTER_NUM" \
         --token_train_stride "$TOKEN_TRAIN_STRIDE" \
         --lora_r "$LORA_R" \
         --lora_alpha "$LORA_ALPHA" \
         --lora_dropout "$LORA_DROPOUT" \
         --gpt_local_path ./gpt \
-        --loss mse \
         --lradj type1 \
         --seed "$SEED"
 done

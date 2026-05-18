@@ -10,10 +10,6 @@ from utils.tools import set_random_seed
 def build_args():
     parser = argparse.ArgumentParser()
     
-    # Model
-    parser.add_argument('--model', type = str, required = False, choices = ['gpt2ts'], default = 'gpt2ts', help = 'model of experiment')
-    parser.add_argument('--task_name', type = str, required = False, choices = ['long_term_forecast'], default = 'long_term_forecast')
-    
     # Model params
     parser.add_argument('--seq_len', type = int, default = 512, help = 'length of the look back window')
     parser.add_argument('--pred_len', type = int, default = 96, help = 'prediction length')
@@ -26,13 +22,11 @@ def build_args():
     parser.add_argument('--stride', type = int, default = 16, help = 'Stride')
     parser.add_argument('--patience', type = int, default = 10, help = 'patience')
     parser.add_argument('--train_epochs', type = int, default = 10, help = 'train epochs')
-    parser.add_argument('--loss', type=str, default='mse', choices=['mse', 'smoothL1'])
     parser.add_argument('--lradj', type=str, default='none', help='learning-rate adjustment policy')
     parser.add_argument('--n_layers', type=int, default=0, help='number of GPT-2 layers to keep; 0 keeps all layers')
     parser.add_argument('--cluster_num', type=int, default=512, help='number of historical patch motifs')
     parser.add_argument('--cluster_normalize', type=bool, default=False, help='z-normalize each patch before motif clustering')
     parser.add_argument('--cluster_seed', type=int, default=None, help='seed for motif clustering')
-    parser.add_argument('--patch_match_tol', type=float, default=1e-6, help='tolerance for exact patch lookup before nearest-neighbor fallback')
     parser.add_argument('--kmeans_iters', type=int, default=30, help='k-means iterations for historical patch motif clustering')
     parser.add_argument('--candidate_token_count', type=int, default=0, help='number of GPT vocab tokens available for motif assignment; 0 uses all non-special tokens')
     parser.add_argument('--token_train_stride', type=int, default=1, help='stride over train patch-token windows for GPT/LoRA training')
@@ -49,44 +43,31 @@ def build_args():
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--results_dir", type=str, default="./results")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument('--use_multi_gpu', action = 'store_true', help = 'use multiple gpus', default = False)
-    parser.add_argument('--devices', type = str, default = '0,1', help = 'device ids of multile gpus')
     parser.add_argument('--use_amp', action = 'store_true', help = 'use automatic mixed precision training', default = False)
     parser.add_argument('--num_workers', type=int, default=0, help='DataLoader workers')
     
     # Input data
-    parser.add_argument('--data', type = str, default = 'ETTh1', choices = ['ETTh1', 'ETTh2', 'ETTm1', 'ETTm2', 'Electricity', 'Weather', 'Traffic'], help = 'dataset')
-    parser.add_argument("--features", type=str, default="S", choices=["M", "S", "MS"])
-    parser.add_argument("--data_path", type=str, default=None)
-    parser.add_argument("--root_path", type=str, default=None)
-    parser.add_argument("--target", type=str, default=None)
-    parser.add_argument("--c_in", type=int, default=None)
-    parser.add_argument("--c_out", type=int, default=None)
-    parser.add_argument("--embed", type=str, default="timeF", help="time feature encoding type")
-    parser.add_argument("--freq", type=str, default="h", help="time feature frequency")
-    parser.add_argument("--seasonal_patterns", type=str, default="Monthly", help="seasonality for M4")
+    parser.add_argument('--data', type = str, default = 'ETTh1', choices = ['ETTh1', 'ETTh2', 'ETTm1', 'ETTm2'], help = 'dataset')
+    parser.add_argument("--features", type=str, default="S", choices=["S", "M"])
     parser.add_argument("--augmentation_ratio", type=float, default=0.0, help="data augmentation ratio")
-    parser.add_argument("--model_id", type=str, default="ETTh1", help="dataset id used by UEA loader")
     
 
     args = parser.parse_args()
     
     # GPU setup
     args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
-    if args.use_gpu and args.use_multi_gpu:
-        args.devices = args.devices.replace(' ','')
-        args.gpu = int(args.devices.split(',')[0])
+    args.model = 'gpt2ts'
+    args.task_name = 'long_term_forecast'
+    args.embed = 'timeF'
+    args.seasonal_patterns = None
 
     
     # Dataset presets
     data_parser = {
-        'ETTh1': {'data': 'ETTh1.csv', 'root_path': './data/ETT/', 'T': 'OT', 'freq': 'h', 'M': [7, 7], 'S': [1, 1], 'MS': [7, 1]},
-        'ETTh2': {'data': 'ETTh2.csv', 'root_path': './data/ETT/', 'T': 'OT', 'freq': 'h', 'M': [7, 7], 'S': [1, 1], 'MS': [7, 1]},
-        'ETTm1': {'data': 'ETTm1.csv', 'root_path': './data/ETT/', 'T': 'OT', 'freq': 't', 'M': [7, 7], 'S': [1, 1], 'MS': [7, 1]},
-        'ETTm2': {'data': 'ETTm2.csv', 'root_path': './data/ETT/', 'T': 'OT', 'freq': 't', 'M': [7, 7], 'S': [1, 1], 'MS': [7, 1]},
-        'Weather': {'data': 'weather.csv', 'root_path': './data/weather/', 'T': 'OT', 'freq': 'h', 'M': [21, 21], 'S': [1, 1], 'MS': [21, 1]},
-        'Traffic': {'data': 'traffic.csv', 'root_path': './data/traffic/', 'T': 'OT', 'freq': 'h', 'M': [862, 862], 'S': [1, 1], 'MS': [862, 1]},
-        'Electricity': {'data': 'electricity.csv', 'root_path': './data/electricity/', 'T': 'OT', 'freq': 'h', 'M': [321, 321], 'S': [1, 1], 'MS': [321, 1]}
+        'ETTh1': {'data': 'ETTh1.csv', 'root_path': './data/ETT/', 'T': 'OT', 'freq': 'h', 'S': [1, 1], 'M': [7, 7]},
+        'ETTh2': {'data': 'ETTh2.csv', 'root_path': './data/ETT/', 'T': 'OT', 'freq': 'h', 'S': [1, 1], 'M': [7, 7]},
+        'ETTm1': {'data': 'ETTm1.csv', 'root_path': './data/ETT/', 'T': 'OT', 'freq': 't', 'S': [1, 1], 'M': [7, 7]},
+        'ETTm2': {'data': 'ETTm2.csv', 'root_path': './data/ETT/', 'T': 'OT', 'freq': 't', 'S': [1, 1], 'M': [7, 7]}
     }
     
     if args.data in data_parser.keys():
@@ -113,7 +94,7 @@ def main():
     if args.cluster_seed is None:
         args.cluster_seed = args.seed
 
-    setting = '{}_{}_dec-sl{}_pl{}_bt{}_ptl{}_stl{}_sd{}'.format(args.model, args.data, args.seq_len, args.pred_len, args.batch_size, args.patch_len, args.stride, args.seed)
+    setting = 'gpt2ts_{}_dec-sl{}_pl{}_bt{}_ptl{}_stl{}_sd{}'.format(args.data, args.seq_len, args.pred_len, args.batch_size, args.patch_len, args.stride, args.seed)
     
     exp = Exp_Main(args)
     

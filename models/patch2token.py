@@ -18,7 +18,6 @@ class PatchTokenDictionary(nn.Module):
         stride=None,
         normalize=True,
         seed=0,
-        match_tol=0.001,
         kmeans_iters=30,
     ):
         super().__init__()
@@ -28,11 +27,8 @@ class PatchTokenDictionary(nn.Module):
         self.c_in = int(c_in)
         self.normalize = bool(normalize)
         self.seed = 0 if seed is None else int(seed)
-        self.match_tol = float(match_tol)
         self.kmeans_iters = max(int(kmeans_iters), 1)
         self.nearest_chunk_size = 1024
-        self.last_exact_match_count = 0
-        self.last_total_match_count = 0
         self.last_dropped_points = 0
 
         self.register_buffer("train_patches", torch.empty(0, self.patch_len, self.c_in), persistent=False)
@@ -60,40 +56,6 @@ class PatchTokenDictionary(nn.Module):
             and self.motif_patches.numel() > 0
             and self.motif_token_ids.numel() > 0
             and self.valid_token_ids.numel() > 0
-        )
-
-    def _resize_for_checkpoint(self, state_dict, prefix):
-        dynamic_names = (
-            "train_patches",
-            "train_patch_features",
-            "train_patch_token_ids",
-            "train_patch_motif_ids",
-            "train_patch_match_scores",
-            "patch_centers",
-            "patch_cluster_ids",
-            "patch_cluster_sizes",
-            "motif_patches",
-            "motif_features",
-            "motif_token_ids",
-            "token_to_motif_ids",
-            "valid_token_ids",
-            "fitted",
-        )
-        for name in dynamic_names:
-            key = prefix + name
-            if key in state_dict and getattr(self, name).shape != state_dict[key].shape:
-                setattr(self, name, torch.empty_like(state_dict[key]))
-
-    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
-        self._resize_for_checkpoint(state_dict, prefix)
-        super()._load_from_state_dict(
-            state_dict,
-            prefix,
-            local_metadata,
-            strict,
-            missing_keys,
-            unexpected_keys,
-            error_msgs,
         )
 
     def _patch_features(self, patches):
@@ -288,14 +250,12 @@ class PatchTokenDictionary(nn.Module):
             raise RuntimeError("PatchTokenDictionary must be fitted before converting patches to tokens.")
         patch_features = self._patch_features(patches.reshape(-1, self.patch_len, self.c_in))
         flat = patch_features.reshape(patch_features.shape[0], -1).float()
-        motif_ids, nearest_distances = self._nearest_center_ids(flat, self.patch_centers.float())
-        self.last_exact_match_count = int((nearest_distances <= self.match_tol).sum().item())
-        self.last_total_match_count = int(flat.shape[0])
+        motif_ids, _ = self._nearest_center_ids(flat, self.patch_centers.float())
         token_ids = self.motif_token_ids[motif_ids]
         return token_ids.reshape(patches.shape[0], patches.shape[1])
 
     @torch.no_grad()
-    def token_ids_to_patches(self, token_ids, vocab_embeds=None):
+    def token_ids_to_patches(self, token_ids):
         if not self.ready:
             raise RuntimeError("PatchTokenDictionary must be fitted before converting tokens to patches.")
 
@@ -307,24 +267,7 @@ class PatchTokenDictionary(nn.Module):
 
         missing = motif_ids < 0
         if bool(missing.any().item()):
-            if vocab_embeds is None:
-                raise RuntimeError(
-                    "Generated token is not in the motif-token table; pass vocab_embeds to find "
-                    "the nearest used token."
-                )
-            vocab_embeds = vocab_embeds.detach().float().to(device)
-            used_token_ids = self.valid_token_ids.to(device)
-            used_vocab_embeds = vocab_embeds[used_token_ids]
-            missing_token_ids = flat_tokens[missing].clamp(min=0, max=vocab_embeds.shape[0] - 1)
-            replacement = torch.empty_like(missing_token_ids)
-
-            chunk_size = max(int(self.nearest_chunk_size), 1)
-            for start in range(0, missing_token_ids.shape[0], chunk_size):
-                end = min(start + chunk_size, missing_token_ids.shape[0])
-                distances = torch.cdist(vocab_embeds[missing_token_ids[start:end]], used_vocab_embeds)
-                replacement[start:end] = used_token_ids[distances.argmin(dim=-1)]
-
-            motif_ids[missing] = self.token_to_motif_ids[replacement]
+            raise RuntimeError("Generated token is not in the motif-token table.")
 
         if bool((motif_ids < 0).any().item()):
             raise RuntimeError("Some generated tokens could not be mapped back to motifs.")
@@ -358,7 +301,6 @@ class PatchTokenDictionary(nn.Module):
             c_in=np.array(self.c_in),
             normalize=np.array(self.normalize),
             seed=np.array(self.seed),
-            match_tol=np.array(self.match_tol),
             kmeans_iters=np.array(self.kmeans_iters),
             dropped_points=np.array(self.last_dropped_points),
         )
@@ -380,7 +322,6 @@ class PatchTokenDictionary(nn.Module):
         self.c_in = int(data["c_in"])
         self.normalize = bool(data["normalize"])
         self.seed = int(data["seed"])
-        self.match_tol = float(data["match_tol"])
         self.kmeans_iters = int(data["kmeans_iters"]) if "kmeans_iters" in data else self.kmeans_iters
         self.last_dropped_points = int(data["dropped_points"]) if "dropped_points" in data else 0
 
