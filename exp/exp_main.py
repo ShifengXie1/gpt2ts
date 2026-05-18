@@ -153,7 +153,11 @@ class Exp_Main(Exp_Basic):
             file.write(f"random_ce_baseline_log_allowed: {random_ce:.4f}\n")
             file.write(f"patch_len: {int(self.model.patch_len)}\n")
             file.write(f"history_patch_count: {int(self.model.history_patch_count)}\n")
+            if hasattr(self.model, "boundary_patch_count"):
+                file.write(f"boundary_patch_count: {int(self.model.boundary_patch_count)}\n")
             file.write(f"future_patch_count: {int(self.model.future_patch_count)}\n")
+            if hasattr(self.model, "generated_patch_count"):
+                file.write(f"generated_patch_count: {int(self.model.generated_patch_count)}\n")
             file.write(f"cluster_num: {int(dictionary.cluster_num)}\n")
 
     def _nearest_used_token_replacements(self, generated_counts):
@@ -259,12 +263,12 @@ class Exp_Main(Exp_Basic):
         patience_counter = 0
 
         print(
-            "\tToken LM training windows: {0} | input tokens: {1} | future labels/window: {2}".format(
-                len(dataset),
-                input_ids.shape[1],
-                self.model.future_patch_count,
+                "\tToken LM training windows: {0} | input tokens: {1} | future labels/window: {2}".format(
+                    len(dataset),
+                    input_ids.shape[1],
+                    getattr(self.model, "generated_patch_count", self.model.future_patch_count),
+                )
             )
-        )
 
         for epoch in range(self.args.train_epochs):
             token_losses = []

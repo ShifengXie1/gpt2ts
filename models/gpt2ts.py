@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import math
 
 import torch
 import torch.nn as nn
@@ -38,15 +39,21 @@ class GPT2TS(nn.Module):
 
         if getattr(configs, "features", "S") != "S" or self.c_in != 1:
             raise ValueError("The patch-token GPT flow currently supports only features='S' with c_in=1.")
-        if self.stride != self.patch_len:
-            raise ValueError("This patch-token GPT flow requires non-overlap patches, so stride must equal patch_len.")
-        if self.seq_len % self.patch_len != 0:
-            raise ValueError("seq_len must be divisible by patch_len for non-overlap tokenization.")
-        if self.pred_len % self.patch_len != 0:
-            raise ValueError("pred_len must be divisible by patch_len for direct patch concatenation.")
+        if self.patch_len <= 0 or self.stride <= 0:
+            raise ValueError("patch_len and stride must be positive.")
+        if self.seq_len < self.patch_len:
+            raise ValueError("seq_len must be at least patch_len.")
+        if self.stride > self.patch_len:
+            raise ValueError("stride must be <= patch_len for patch-token forecasting.")
+        if self.patch_len % self.stride != 0:
+            raise ValueError("patch_len must be divisible by stride for aligned patch-token forecasting.")
+        if self.seq_len % self.stride != 0:
+            raise ValueError("seq_len must be divisible by stride for aligned patch-token forecasting.")
 
-        self.history_patch_count = self.seq_len // self.patch_len
-        self.future_patch_count = self.pred_len // self.patch_len
+        self.history_patch_count = self._history_patch_count(self.seq_len)
+        self.future_patch_count = self._future_patch_count(self.pred_len)
+        self.boundary_patch_count = max(self.seq_len // self.stride - self.history_patch_count, 0)
+        self.generated_patch_count = self.boundary_patch_count + self.future_patch_count
 
         self.gpt2_path = getattr(configs, "gpt_local_path", "./gpt")
         self.local_files_only = getattr(configs, "gpt_local_files_only", True)
@@ -64,9 +71,11 @@ class GPT2TS(nn.Module):
             cluster_num=cluster_num,
             patch_len=self.patch_len,
             c_in=self.c_in,
+            stride=self.stride,
             normalize=getattr(configs, "cluster_normalize", False),
             seed=getattr(configs, "cluster_seed", 0),
             match_tol=getattr(configs, "patch_match_tol", 1e-6),
+            kmeans_iters=getattr(configs, "kmeans_iters", 30),
         )
 
     def _load_gpt2(self, config):
@@ -100,9 +109,29 @@ class GPT2TS(nn.Module):
     def _vocab_weight(self):
         return self.gpt2.get_input_embeddings().weight.detach()
 
+    def _candidate_token_ids(self):
+        vocab_size = self._vocab_weight().shape[0]
+        candidate_token_ids = torch.arange(vocab_size, dtype=torch.long, device=self._vocab_weight().device)
+
+        special_ids = [
+            getattr(self.gpt2.config, "bos_token_id", None),
+            getattr(self.gpt2.config, "eos_token_id", None),
+            getattr(self.gpt2.config, "pad_token_id", None),
+        ]
+        keep = torch.ones(vocab_size, dtype=torch.bool, device=candidate_token_ids.device)
+        for token_id in special_ids:
+            if token_id is not None and 0 <= int(token_id) < vocab_size:
+                keep[int(token_id)] = False
+        candidate_token_ids = candidate_token_ids[keep]
+
+        candidate_count = int(getattr(self.configs, "candidate_token_count", 0) or 0)
+        if candidate_count > 0:
+            candidate_token_ids = candidate_token_ids[:candidate_count]
+        return candidate_token_ids
+
     @torch.no_grad()
     def fit_patch_token_map(self, train_series):
-        self.dictionary.fit(train_series, self._vocab_weight())
+        self.dictionary.fit(train_series, self._vocab_weight(), self._candidate_token_ids())
 
     @torch.no_grad()
     def print_patch_token_distribution(self):
@@ -139,7 +168,7 @@ class GPT2TS(nn.Module):
             raise RuntimeError("Call fit_patch_token_map before building token LM training data.")
 
         tokens = self.dictionary.train_patch_token_ids.detach().long()
-        window_size = self.history_patch_count + self.future_patch_count
+        window_size = self.history_patch_count + self.generated_patch_count
         if tokens.numel() < window_size:
             raise ValueError(
                 f"Training token sequence has {tokens.numel()} patches, but at least {window_size} are required."
@@ -204,17 +233,45 @@ class GPT2TS(nn.Module):
     def _patchify_batch(self, batch_x):
         if batch_x.shape[1] != self.seq_len:
             raise ValueError(f"Expected batch_x length {self.seq_len}, got {batch_x.shape[1]}.")
-        patches = batch_x.unfold(dimension=1, size=self.patch_len, step=self.patch_len)
+        patches = batch_x.unfold(dimension=1, size=self.patch_len, step=self.stride)
         patches = patches.permute(0, 1, 3, 2).contiguous()
+        if patches.shape[1] != self.history_patch_count:
+            raise RuntimeError(
+                f"Expected {self.history_patch_count} history patches, got {patches.shape[1]}."
+            )
         return patches
 
     def _concat_patches(self, patches):
-        return patches.reshape(patches.shape[0], patches.shape[1] * self.patch_len, self.c_in)[:, : self.pred_len, :]
+        if self.stride == self.patch_len:
+            return patches.reshape(patches.shape[0], patches.shape[1] * self.patch_len, self.c_in)[:, : self.pred_len, :]
+
+        total_len = (patches.shape[1] - 1) * self.stride + self.patch_len
+        out = patches.new_zeros(patches.shape[0], total_len, self.c_in)
+        weight = patches.new_zeros(total_len)
+        window = torch.hann_window(self.patch_len, periodic=False, device=patches.device, dtype=patches.dtype)
+        window = window.clamp_min(1e-3)
+
+        for patch_idx in range(patches.shape[1]):
+            start = patch_idx * self.stride
+            out[:, start:start + self.patch_len, :] += patches[:, patch_idx] * window.view(1, -1, 1)
+            weight[start:start + self.patch_len] += window
+
+        out = out / weight.clamp_min(1e-6).view(1, -1, 1)
+        return out[:, : self.pred_len, :]
+
+    def _history_patch_count(self, length):
+        return (int(length) - self.patch_len) // self.stride + 1
+
+    def _future_patch_count(self, length):
+        length = int(length)
+        if length <= self.patch_len:
+            return 1
+        return math.ceil((length - self.patch_len) / self.stride) + 1
 
     @torch.no_grad()
     def _generate_future_tokens(self, history_token_ids):
-        max_positions = int(getattr(self.gpt2.config, "n_positions", history_token_ids.shape[1] + self.future_patch_count))
-        max_history = max_positions - self.future_patch_count
+        max_positions = int(getattr(self.gpt2.config, "n_positions", history_token_ids.shape[1] + self.generated_patch_count))
+        max_history = max_positions - self.generated_patch_count
         if max_history <= 0:
             raise ValueError("GPT context length is smaller than the requested future patch count.")
         if history_token_ids.shape[1] > max_history:
@@ -228,8 +285,8 @@ class GPT2TS(nn.Module):
             input_ids=history_token_ids,
             attention_mask=attention_mask,
             logits_processor=logits_processor,
-            min_new_tokens=self.future_patch_count,
-            max_new_tokens=self.future_patch_count,
+            min_new_tokens=self.generated_patch_count,
+            max_new_tokens=self.generated_patch_count,
             do_sample=False,
             pad_token_id=getattr(self.gpt2.config, "pad_token_id", None) or getattr(self.gpt2.config, "eos_token_id", 0),
             eos_token_id=getattr(self.gpt2.config, "eos_token_id", None),
