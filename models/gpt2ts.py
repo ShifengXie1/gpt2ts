@@ -199,11 +199,12 @@ class GPT2TS(nn.Module):
 
     @torch.no_grad()
     def fit_patch_token_map(self, train_series):
+        motif_projector = self._project_motif_features_for_assignment if self.use_trainable_patch_projector else None
         self.dictionary.fit(
             train_series,
             self._vocab_weight(),
             self._candidate_token_ids(),
-            motif_projector=None,
+            motif_projector=motif_projector,
         )
         valid_count = int(self.dictionary.valid_token_ids.numel())
         if valid_count < 2:
@@ -310,6 +311,13 @@ class GPT2TS(nn.Module):
         return torch.matmul(projected, candidate_embeds.transpose(0, 1))
 
     def _hard_patch_token_ids(self, patches):
+        if self.use_trainable_patch_projector:
+            scores = self._candidate_scores(patches)
+            valid_candidate_indices = self.dictionary.valid_candidate_indices.to(scores.device).long()
+            valid_scores = scores.index_select(dim=-1, index=valid_candidate_indices)
+            motif_ids = valid_scores.argmax(dim=-1)
+            valid_token_ids = self.dictionary.valid_token_ids.to(scores.device).long()
+            return valid_token_ids[motif_ids]
         return self.dictionary.patches_to_token_ids(patches)
 
     def _future_prediction_positions(self, input_length, device):
