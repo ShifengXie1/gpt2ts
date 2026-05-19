@@ -25,6 +25,7 @@ LORA_DROPOUT=0.05
 CANDIDATE_TOKEN_NUM=4096
 PATCH_BANK_TOPK=8
 ASSIGNMENT_METHOD="hungarian"
+REMATCH_INTERVAL=1
 USE_TRAINABLE_PATCH_PROJECTOR=True
 PATCH_ENCODER_DIM=256
 PATCH_BANK_ATTN_DIM=128
@@ -56,6 +57,7 @@ for pred_len in "${PRED_LENS[@]}"; do
         --candidate_token_num "$CANDIDATE_TOKEN_NUM" \
         --patch_bank_topk "$PATCH_BANK_TOPK" \
         --assignment_method "$ASSIGNMENT_METHOD" \
+        --rematch_interval "$REMATCH_INTERVAL" \
         --token_train_stride "$TOKEN_TRAIN_STRIDE" \
         --use_trainable_patch_projector "$USE_TRAINABLE_PATCH_PROJECTOR" \
         --patch_encoder_dim "$PATCH_ENCODER_DIM" \

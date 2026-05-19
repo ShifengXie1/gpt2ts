@@ -223,6 +223,17 @@ class GPT2TS(nn.Module):
         self.dictionary.load_npz(path)
 
     @torch.no_grad()
+    def refresh_patch_token_assignment(self):
+        if not self.dictionary.ready:
+            raise RuntimeError("Call fit_patch_token_map before refreshing patch-token assignments.")
+        motif_projector = self._project_motif_features_for_assignment if self.use_trainable_patch_projector else None
+        return self.dictionary.refresh_assignment(
+            self._vocab_weight(),
+            candidate_token_ids=self.dictionary.candidate_token_ids,
+            motif_projector=motif_projector,
+        )
+
+    @torch.no_grad()
     def build_lm_training_tensors(self):
         if not self.dictionary.ready:
             raise RuntimeError("Call fit_patch_token_map before building token LM training data.")

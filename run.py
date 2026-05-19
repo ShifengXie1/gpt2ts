@@ -43,6 +43,7 @@ def build_args():
     parser.add_argument('--candidate_token_num', type=int, default=4096, help='filtered GPT vocab candidate pool size')
     parser.add_argument('--patch_bank_topk', type=int, default=8, help='top-k real patches stored for each motif')
     parser.add_argument('--assignment_method', type=str, default='hungarian', choices=['hungarian', 'greedy'])
+    parser.add_argument('--rematch_interval', type=int, default=0, help='epochs between dynamic motif-token rematches; 0 disables')
     parser.add_argument('--token_train_stride', type=int, default=1, help='stride over train patch-token windows for GPT/LoRA training')
     parser.add_argument('--use_trainable_patch_projector', type=str2bool, default=True)
     parser.add_argument('--patch_encoder_dim', type=int, default=256)

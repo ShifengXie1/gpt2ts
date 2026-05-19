@@ -182,6 +182,7 @@ class Exp_Main(Exp_Basic):
             if hasattr(self.model, "generated_patch_count"):
                 file.write(f"generated_patch_count: {int(self.model.generated_patch_count)}\n")
             file.write(f"cluster_num: {int(dictionary.cluster_num)}\n")
+            file.write(f"rematch_interval: {int(getattr(self.args, 'rematch_interval', 0) or 0)}\n")
 
     def _write_test_token_log(self, save_dir, future_token_ids):
         if not future_token_ids:
@@ -216,27 +217,38 @@ class Exp_Main(Exp_Basic):
             self._save_model_checkpoint(checkpoint_path)
             return False
 
-        training_tensors = self.model.build_lm_training_tensors()
-        dataset = TensorDataset(
-            training_tensors.input_ids.detach().cpu(),
-            training_tensors.labels.detach().cpu(),
-            training_tensors.future_patches.detach().cpu(),
-            training_tensors.align_patches.detach().cpu(),
-            training_tensors.align_candidate_indices.detach().cpu(),
-        )
         token_batch_size = int(getattr(self.args, "token_batch_size", self.args.batch_size) or self.args.batch_size)
-        token_loader = DataLoader(
-            dataset,
-            batch_size=max(token_batch_size, 1),
-            shuffle=True,
-            num_workers=self.args.num_workers,
-            drop_last=False,
-        )
+
+        def build_token_loader():
+            training_tensors = self.model.build_lm_training_tensors()
+            dataset = TensorDataset(
+                training_tensors.input_ids.detach().cpu(),
+                training_tensors.labels.detach().cpu(),
+                training_tensors.future_patches.detach().cpu(),
+                training_tensors.align_patches.detach().cpu(),
+                training_tensors.align_candidate_indices.detach().cpu(),
+            )
+            token_loader = DataLoader(
+                dataset,
+                batch_size=max(token_batch_size, 1),
+                shuffle=True,
+                num_workers=self.args.num_workers,
+                drop_last=False,
+            )
+            return training_tensors, dataset, token_loader
+
+        training_tensors, dataset, token_loader = build_token_loader()
 
         model_optim = optim.Adam(trainable_params, lr=self.args.learning_rate, weight_decay=self.args.weight_decay)
         scaler = torch.amp.GradScaler(enabled=self.amp_enabled)
         best_vali_mse = float("inf")
         patience_counter = 0
+        rematch_interval = int(getattr(self.args, "rematch_interval", 0) or 0)
+        can_refresh_assignment = (
+            rematch_interval > 0
+            and bool(getattr(self.args, "use_trainable_patch_projector", False))
+            and hasattr(self.model, "refresh_patch_token_assignment")
+        )
 
         print(
                 "\tToken LM training windows: {0} | input tokens: {1} | future labels/window: {2}".format(
@@ -247,6 +259,20 @@ class Exp_Main(Exp_Basic):
             )
 
         for epoch in range(self.args.train_epochs):
+            if epoch > 0 and can_refresh_assignment and epoch % rematch_interval == 0:
+                self.model.eval()
+                refresh_stats = self.model.refresh_patch_token_assignment()
+                training_tensors, dataset, token_loader = build_token_loader()
+                print(
+                    "\tAssignment refresh before epoch {0}: changed motifs {1}/{2} | valid tokens {3} | method {4}".format(
+                        epoch + 1,
+                        refresh_stats["changed_motif_count"],
+                        refresh_stats["motif_count"],
+                        refresh_stats["valid_token_count"],
+                        refresh_stats["assignment_method"],
+                    )
+                )
+
             loss_sums = {
                 "total_loss": 0.0,
                 "ce_loss": 0.0,
@@ -389,6 +415,8 @@ class Exp_Main(Exp_Basic):
             trained_lm = self._train_patch_token_lm(checkpoint_dir, vali_loader, test_loader)
             if not trained_lm:
                 self._save_model_checkpoint(os.path.join(checkpoint_dir, "checkpoint.pth"))
+            self.model.save_patch_token_map(os.path.join(save_dir, "patch_token_map.npz"))
+            self._write_train_token_log(save_dir)
 
             vali_loss, vali_mae = self.vali(vali_loader)
             test_loss, test_mae = self.vali(test_loader)

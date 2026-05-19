@@ -243,6 +243,45 @@ class PatchTokenDictionary(nn.Module):
         return motif_token_ids, token_to_motif_ids, motif_candidate_indices, candidate_token_ids
 
     @torch.no_grad()
+    def refresh_assignment(self, vocab_embeds, candidate_token_ids=None, motif_projector=None):
+        if not self.ready:
+            raise RuntimeError("PatchTokenDictionary must be fitted before refreshing token assignments.")
+
+        old_motif_token_ids = self.motif_token_ids.detach().clone()
+        if candidate_token_ids is None:
+            candidate_token_ids = self.candidate_token_ids
+
+        device = self.motif_features.device
+        motif_token_ids, token_to_motif_ids, motif_candidate_indices, candidate_token_ids = self._assign_motif_tokens(
+            self.motif_features,
+            vocab_embeds.detach().float().to(device),
+            candidate_token_ids,
+            motif_projector=motif_projector,
+        )
+
+        train_motif_ids = self.train_patch_motif_ids.to(device=device, dtype=torch.long)
+        train_token_ids = motif_token_ids[train_motif_ids]
+        train_candidate_indices = motif_candidate_indices[train_motif_ids]
+        changed_motif_count = int((old_motif_token_ids.to(motif_token_ids.device) != motif_token_ids).sum().item())
+
+        self.train_patch_token_ids = train_token_ids.detach()
+        self.train_patch_candidate_indices = train_candidate_indices.detach()
+        self.motif_token_ids = motif_token_ids.detach()
+        self.motif_candidate_indices = motif_candidate_indices.detach()
+        self.token_to_motif_ids = token_to_motif_ids.detach()
+        self.valid_token_ids = motif_token_ids.detach()
+        self.valid_candidate_indices = motif_candidate_indices.detach()
+        self.candidate_token_ids = candidate_token_ids.detach()
+
+        return {
+            "changed_motif_count": changed_motif_count,
+            "motif_count": int(motif_token_ids.numel()),
+            "valid_token_count": int(self.valid_token_ids.numel()),
+            "candidate_token_count": int(self.candidate_token_ids.numel()),
+            "assignment_method": self.last_assignment_method,
+        }
+
+    @torch.no_grad()
     def _patchify_series(self, series):
         series = torch.as_tensor(series, dtype=torch.float32, device=self.train_patches.device)
         if series.ndim == 2:
