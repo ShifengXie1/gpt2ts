@@ -34,6 +34,28 @@ def build_args():
     parser.add_argument('--patience', type = int, default = 10, help = 'patience')
     parser.add_argument('--train_epochs', type = int, default = 10, help = 'train epochs')
     parser.add_argument('--lradj', type=str, default='none', help='learning-rate adjustment policy')
+    parser.add_argument('--patch_tokenizer', type=str, default='patch2token', choices=['patch2token', 'native_gpt_vocab'])
+    parser.add_argument('--candidate_token_mode', type=str, default='all', choices=['all', 'numeric', 'common_text', 'file'])
+    parser.add_argument('--candidate_token_file', type=str, default=None)
+    parser.add_argument('--native_token_k', type=int, default=4)
+    parser.add_argument('--patch_encoder_hidden_dim', type=int, default=512)
+    parser.add_argument('--patch_decoder_hidden_dim', type=int, default=512)
+    parser.add_argument('--vq_tau', type=float, default=1.0)
+    parser.add_argument('--vq_tau_min', type=float, default=0.05)
+    parser.add_argument('--use_straight_through', type=str2bool, default=True)
+    parser.add_argument('--use_inputs_embeds_for_training', type=str2bool, default=True)
+    parser.add_argument('--commitment_loss_weight', type=float, default=0.25)
+    parser.add_argument('--usage_loss_weight', type=float, default=0.01)
+    parser.add_argument('--recon_loss_weight', type=float, default=1.0)
+    parser.add_argument('--token_ce_loss_weight', type=float, default=1.0)
+    parser.add_argument('--forecast_loss_weight', type=float, default=1.0)
+    parser.add_argument(
+        '--train_stage',
+        type=str,
+        default='joint_train',
+        choices=['tokenizer_pretrain', 'gpt_train', 'joint_train'],
+    )
+    parser.add_argument('--freeze_gpt_codebook', type=str2bool, default=True)
     parser.add_argument('--n_layers', type=int, default=0, help='number of GPT-2 layers to keep; 0 keeps all layers')
     parser.add_argument('--cluster_num', type=int, default=512, help='number of historical patch motifs')
     parser.add_argument('--cluster_normalize', type=bool, default=False, help='z-normalize each patch before motif clustering')

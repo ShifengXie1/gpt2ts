@@ -7,6 +7,12 @@ import torch.nn.functional as F
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, LogitsProcessor, LogitsProcessorList
 
 from models.lora import LoRAConv1D
+from models.native_gpt_vocab import (
+    NativeGPTVocabQuantizer,
+    NativePatchDecoder,
+    NativePatchEncoder,
+    build_candidate_token_ids,
+)
 from models.patch2token import PatchTokenDictionary
 from models.patch_token_layers import PatchBankDecoder, PatchProjector, ResidualHead, l2_normalize
 
@@ -37,8 +43,12 @@ class GPT2TS(nn.Module):
         self.c_in = int(configs.c_in)
         self.patch_len = int(configs.patch_len)
         self.stride = int(configs.stride)
+        self.patch_tokenizer = str(getattr(configs, "patch_tokenizer", "patch2token"))
+        self.use_native_gpt_vocab = self.patch_tokenizer == "native_gpt_vocab"
+        if self.patch_tokenizer not in {"patch2token", "native_gpt_vocab"}:
+            raise ValueError("Unsupported patch_tokenizer '{}'. ".format(self.patch_tokenizer))
 
-        if getattr(configs, "features", "S") != "S" or self.c_in != 1:
+        if not self.use_native_gpt_vocab and (getattr(configs, "features", "S") != "S" or self.c_in != 1):
             raise ValueError("The patch-token GPT flow currently supports only features='S' with c_in=1.")
         if self.patch_len <= 0 or self.stride <= 0:
             raise ValueError("patch_len and stride must be positive.")
@@ -78,9 +88,17 @@ class GPT2TS(nn.Module):
         self._freeze_gpt2()
         self._inject_lora()
 
+        self.original_vocab_size = int(self.gpt2.get_input_embeddings().weight.shape[0])
         self.gpt_dim = int(self.gpt2.get_input_embeddings().weight.shape[-1])
-        patch_encoder_dim = int(getattr(configs, "patch_encoder_dim", 256))
-        patch_bank_attn_dim = int(getattr(configs, "patch_bank_attn_dim", 128))
+        self.tokenizer = self._load_tokenizer()
+        if self.use_native_gpt_vocab:
+            self._init_native_gpt_vocab()
+        else:
+            self._init_patch2token_legacy()
+
+    def _init_patch2token_legacy(self):
+        patch_encoder_dim = int(getattr(self.configs, "patch_encoder_dim", 256))
+        patch_bank_attn_dim = int(getattr(self.configs, "patch_bank_attn_dim", 128))
         self.patch_projector = PatchProjector(self.patch_dim, patch_encoder_dim, self.gpt_dim)
         self.patch_bank_decoder = PatchBankDecoder(
             self.gpt_dim,
@@ -93,19 +111,70 @@ class GPT2TS(nn.Module):
             for param in self.patch_projector.parameters():
                 param.requires_grad = False
 
-        cluster_num = int(getattr(configs, "cluster_num", 1))
+        cluster_num = int(getattr(self.configs, "cluster_num", 1))
         self.dictionary = PatchTokenDictionary(
             cluster_num=cluster_num,
             patch_len=self.patch_len,
             c_in=self.c_in,
             stride=self.stride,
-            normalize=getattr(configs, "cluster_normalize", False),
-            seed=getattr(configs, "cluster_seed", 0),
-            kmeans_iters=getattr(configs, "kmeans_iters", 30),
-            patch_bank_topk=getattr(configs, "patch_bank_topk", 8),
-            assignment_method=getattr(configs, "assignment_method", "hungarian"),
+            normalize=getattr(self.configs, "cluster_normalize", False),
+            seed=getattr(self.configs, "cluster_seed", 0),
+            kmeans_iters=getattr(self.configs, "kmeans_iters", 30),
+            patch_bank_topk=getattr(self.configs, "patch_bank_topk", 8),
+            assignment_method=getattr(self.configs, "assignment_method", "hungarian"),
         )
-        self.tokenizer = self._load_tokenizer()
+
+    def _init_native_gpt_vocab(self):
+        if int(getattr(self.configs, "native_token_k", 4)) <= 0:
+            raise ValueError("--native_token_k must be positive.")
+
+        self.native_token_k = int(getattr(self.configs, "native_token_k", 4))
+        self.use_inputs_embeds_for_training = bool(getattr(self.configs, "use_inputs_embeds_for_training", True))
+        self.recon_loss_weight = float(getattr(self.configs, "recon_loss_weight", 1.0))
+        self.token_ce_loss_weight = float(getattr(self.configs, "token_ce_loss_weight", 1.0))
+        self.forecast_loss_weight = float(getattr(self.configs, "forecast_loss_weight", 1.0))
+        self.commitment_loss_weight = float(getattr(self.configs, "commitment_loss_weight", 0.25))
+        self.usage_loss_weight = float(getattr(self.configs, "usage_loss_weight", 0.01))
+        self.train_stage = str(getattr(self.configs, "train_stage", "joint_train"))
+        self.freeze_gpt_codebook = bool(getattr(self.configs, "freeze_gpt_codebook", True))
+
+        allowed_token_ids = build_candidate_token_ids(
+            self.tokenizer,
+            self.original_vocab_size,
+            mode=getattr(self.configs, "candidate_token_mode", "all"),
+            candidate_token_file=getattr(self.configs, "candidate_token_file", None),
+            device=self.gpt2.get_input_embeddings().weight.device,
+        )
+        self.native_patch_encoder = NativePatchEncoder(
+            self.patch_len,
+            self.c_in,
+            int(getattr(self.configs, "patch_encoder_hidden_dim", 512)),
+            self.native_token_k,
+            self.gpt_dim,
+        )
+        self.native_quantizer = NativeGPTVocabQuantizer(
+            allowed_token_ids,
+            self.original_vocab_size,
+            tau=float(getattr(self.configs, "vq_tau", 1.0)),
+            tau_min=float(getattr(self.configs, "vq_tau_min", 0.05)),
+            use_straight_through=bool(getattr(self.configs, "use_straight_through", True)),
+            freeze_codebook=self.freeze_gpt_codebook,
+        )
+        self.native_patch_decoder = NativePatchDecoder(
+            self.patch_len,
+            self.c_in,
+            int(getattr(self.configs, "patch_decoder_hidden_dim", 512)),
+            self.native_token_k,
+            self.gpt_dim,
+        )
+        self._configure_native_train_stage()
+        print(
+            "Native GPT vocab tokenizer: candidate_tokens={} | K={} | original_vocab_size={}".format(
+                int(allowed_token_ids.numel()),
+                self.native_token_k,
+                self.original_vocab_size,
+            )
+        )
 
     def _load_gpt2(self, config):
         if getattr(self.configs, "use_pretrained_gpt2", False):
@@ -125,6 +194,36 @@ class GPT2TS(nn.Module):
     def _freeze_gpt2(self):
         for param in self.gpt2.parameters():
             param.requires_grad = False
+
+    def _set_module_trainable(self, module, trainable):
+        for param in module.parameters():
+            param.requires_grad = bool(trainable)
+
+    def _freeze_gpt_codebook_params(self):
+        embedding = self.gpt2.get_input_embeddings()
+        if embedding is not None:
+            for param in embedding.parameters():
+                param.requires_grad = False
+        output_embedding = self.gpt2.get_output_embeddings()
+        if output_embedding is not None:
+            for param in output_embedding.parameters():
+                param.requires_grad = False
+
+    def _configure_native_train_stage(self):
+        if not self.use_native_gpt_vocab:
+            return
+        if self.train_stage not in {"tokenizer_pretrain", "gpt_train", "joint_train"}:
+            raise ValueError("Unsupported train_stage '{}'.".format(self.train_stage))
+
+        train_tokenizer = self.train_stage in {"tokenizer_pretrain", "joint_train"}
+        train_gpt = self.train_stage in {"gpt_train", "joint_train"}
+        self._set_module_trainable(self.native_patch_encoder, train_tokenizer)
+        self._set_module_trainable(self.native_patch_decoder, train_tokenizer)
+
+        if not train_gpt:
+            self._freeze_gpt2()
+        if self.freeze_gpt_codebook:
+            self._freeze_gpt_codebook_params()
 
     def _inject_lora(self):
         r = int(getattr(self.configs, "lora_r", 0))
@@ -196,6 +295,200 @@ class GPT2TS(nn.Module):
 
     def _project_motif_features_for_assignment(self, motif_features):
         return self._project_patch_features(motif_features)
+
+    def _native_vocab_weight(self, device=None, dtype=None, detach=None):
+        weight = self.gpt2.get_input_embeddings().weight
+        should_detach = self.freeze_gpt_codebook if detach is None else bool(detach)
+        if should_detach:
+            weight = weight.detach()
+        if device is not None or dtype is not None:
+            weight = weight.to(device=device if device is not None else weight.device, dtype=dtype if dtype is not None else weight.dtype)
+        return weight
+
+    def _native_check_token_ids(self, token_ids):
+        if token_ids.numel() == 0:
+            raise RuntimeError("Native GPT vocab tokenizer produced no token ids.")
+        assert int(token_ids.min().item()) >= 0
+        assert int(token_ids.max().item()) < self.original_vocab_size
+
+    def _native_pad_to_patch_coverage(self, series, patch_count):
+        required_len = (int(patch_count) - 1) * self.stride + self.patch_len
+        if series.shape[1] >= required_len:
+            return series[:, :required_len, :]
+        pad_len = required_len - series.shape[1]
+        pad_value = series[:, -1:, :].expand(series.shape[0], pad_len, series.shape[2])
+        return torch.cat([series, pad_value], dim=1)
+
+    def _native_patchify_future(self, target):
+        target = target[:, -self.pred_len :, :]
+        target = self._native_pad_to_patch_coverage(target, self.future_patch_count)
+        patches = self._patchify_any(target)
+        patches = patches[:, : self.future_patch_count].contiguous()
+        if patches.shape[1] != self.future_patch_count:
+            raise RuntimeError(
+                "Expected {} future patches, got {}.".format(self.future_patch_count, patches.shape[1])
+            )
+        return patches
+
+    def _native_quantize_patches(self, patches):
+        patch_repr = self.native_patch_encoder(patches)
+        quantized = self.native_quantizer(
+            patch_repr,
+            self._native_vocab_weight(device=patch_repr.device, dtype=patch_repr.dtype),
+        )
+        batch_size, patch_count = patches.shape[:2]
+        assert quantized.token_ids.shape == (batch_size, patch_count, self.native_token_k)
+        assert quantized.token_embeds.shape == (batch_size, patch_count, self.native_token_k, self.gpt_dim)
+        self._native_check_token_ids(quantized.token_ids)
+        quantized.patch_repr = patch_repr
+        return quantized
+
+    def _native_flatten_token_ids(self, token_ids):
+        flat = token_ids.reshape(token_ids.shape[0], token_ids.shape[1] * token_ids.shape[2]).long()
+        self._native_check_token_ids(flat)
+        return flat
+
+    def _native_flatten_token_embeds(self, token_embeds):
+        return token_embeds.reshape(token_embeds.shape[0], token_embeds.shape[1] * token_embeds.shape[2], token_embeds.shape[-1])
+
+    def _native_assert_context_length(self, token_count):
+        max_positions = int(getattr(self.gpt2.config, "n_positions", token_count))
+        if int(token_count) > max_positions:
+            raise ValueError("Native token sequence length {} exceeds GPT context length {}.".format(token_count, max_positions))
+
+    def _native_ce_from_logits(self, logits, target_token_ids):
+        if logits.shape[:2] != target_token_ids.shape:
+            raise RuntimeError(
+                "Native CE shape mismatch: logits {} target {}.".format(
+                    tuple(logits.shape),
+                    tuple(target_token_ids.shape),
+                )
+            )
+        self._native_check_token_ids(target_token_ids)
+        return F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]),
+            target_token_ids.reshape(-1),
+        )
+
+    def _native_gpt_next_token_logits(self, flat_token_ids, flat_token_embeds):
+        if flat_token_ids.shape[1] < 2:
+            raise RuntimeError("Need at least two native GPT tokens for next-token training.")
+
+        self._native_assert_context_length(flat_token_ids.shape[1])
+        gpt_inputs = flat_token_ids[:, :-1].contiguous()
+        targets = flat_token_ids[:, 1:].contiguous()
+        attention_mask = torch.ones_like(gpt_inputs)
+        if self.use_inputs_embeds_for_training:
+            input_embeds = flat_token_embeds[:, :-1, :].contiguous()
+            outputs = self.gpt2(
+                inputs_embeds=input_embeds,
+                attention_mask=attention_mask,
+                return_dict=True,
+            )
+        else:
+            outputs = self.gpt2(
+                input_ids=gpt_inputs,
+                attention_mask=attention_mask,
+                return_dict=True,
+            )
+        if outputs.logits.shape[-1] != self.original_vocab_size:
+            raise RuntimeError("GPT logits vocab size changed; resizing token embeddings is not allowed.")
+        return outputs.logits, targets
+
+    def native_training_loss(self, batch_x, target, force_gpt=False):
+        if not self.use_native_gpt_vocab:
+            raise RuntimeError("native_training_loss is only available with --patch_tokenizer native_gpt_vocab.")
+
+        history_patches = self._patchify_batch(batch_x)
+        future_patches = self._native_patchify_future(target)
+        all_patches = torch.cat([history_patches, future_patches], dim=1)
+        quantized = self._native_quantize_patches(all_patches)
+
+        history_token_embeds = quantized.token_embeds[:, : self.history_patch_count]
+        recon_patches = self.native_patch_decoder(history_token_embeds)
+        loss_recon = F.mse_loss(recon_patches, history_patches)
+
+        zero = quantized.commitment_loss.new_zeros(())
+        loss_ce = zero
+        loss_forecast = zero
+        pred_patches = None
+        run_gpt = force_gpt or self.train_stage in {"gpt_train", "joint_train"}
+        flat_token_ids = self._native_flatten_token_ids(quantized.token_ids)
+        flat_token_embeds = self._native_flatten_token_embeds(quantized.token_embeds)
+
+        if run_gpt:
+            logits, targets = self._native_gpt_next_token_logits(flat_token_ids, flat_token_embeds)
+            loss_ce = self._native_ce_from_logits(logits, targets)
+
+            history_token_count = self.history_patch_count * self.native_token_k
+            future_token_count = self.future_patch_count * self.native_token_k
+            start = history_token_count - 1
+            end = start + future_token_count
+            if end <= logits.shape[1]:
+                future_logits = logits[:, start:end, :]
+                future_probs = torch.softmax(future_logits, dim=-1)
+                codebook = self._native_vocab_weight(
+                    device=future_probs.device,
+                    dtype=future_probs.dtype,
+                    detach=True,
+                )
+                pred_embeds = torch.matmul(future_probs, codebook)
+                pred_embeds = pred_embeds.reshape(
+                    batch_x.shape[0],
+                    self.future_patch_count,
+                    self.native_token_k,
+                    self.gpt_dim,
+                )
+                pred_patches = self.native_patch_decoder(pred_embeds)
+                loss_forecast = F.mse_loss(pred_patches, future_patches)
+
+        if self.train_stage == "tokenizer_pretrain":
+            total_loss = (
+                self.recon_loss_weight * loss_recon
+                + self.commitment_loss_weight * quantized.commitment_loss
+                + self.usage_loss_weight * quantized.usage_loss
+            )
+        elif self.train_stage == "gpt_train":
+            total_loss = self.token_ce_loss_weight * loss_ce
+        elif self.train_stage == "joint_train":
+            total_loss = (
+                self.token_ce_loss_weight * loss_ce
+                + self.recon_loss_weight * loss_recon
+                + self.forecast_loss_weight * loss_forecast
+                + self.commitment_loss_weight * quantized.commitment_loss
+                + self.usage_loss_weight * quantized.usage_loss
+            )
+        else:
+            raise ValueError("Unsupported train_stage '{}'.".format(self.train_stage))
+
+        return SimpleNamespace(
+            total_loss=total_loss,
+            loss_ce=loss_ce,
+            loss_recon=loss_recon,
+            loss_forecast=loss_forecast,
+            commitment_loss=quantized.commitment_loss,
+            usage_loss=quantized.usage_loss,
+            history_patches=history_patches,
+            future_patches=future_patches,
+            recon_patches=recon_patches,
+            pred_patches=pred_patches,
+            token_ids=quantized.token_ids,
+        )
+
+    @torch.no_grad()
+    def native_debug_token_check(self, batch_x, max_items=12):
+        history_patches = self._patchify_batch(batch_x)
+        quantized = self._native_quantize_patches(history_patches)
+        flat_ids = quantized.token_ids.reshape(-1)
+        self._native_check_token_ids(flat_ids)
+        sample_ids = flat_ids[: int(max_items)].detach().cpu().tolist()
+        return {
+            "min_token_id": int(flat_ids.min().detach().cpu().item()),
+            "max_token_id": int(flat_ids.max().detach().cpu().item()),
+            "original_vocab_size": int(self.original_vocab_size),
+            "candidate_token_count": int(self.native_quantizer.allowed_token_ids.numel()),
+            "sample_token_ids": sample_ids,
+        }
 
     @torch.no_grad()
     def fit_patch_token_map(self, train_series):
@@ -480,6 +773,70 @@ class GPT2TS(nn.Module):
         return math.ceil((length - self.patch_len) / self.stride) + 1
 
     @torch.no_grad()
+    def _generate_native_future_tokens(self, context_ids):
+        future_token_count = self.future_patch_count * self.native_token_k
+        max_positions = int(getattr(self.gpt2.config, "n_positions", context_ids.shape[1] + future_token_count))
+        max_history = max_positions - future_token_count
+        max_history = (max_history // self.native_token_k) * self.native_token_k
+        if max_history <= 0:
+            raise ValueError("GPT context length is smaller than the requested native future token count.")
+        if context_ids.shape[1] > max_history:
+            context_ids = context_ids[:, -max_history:]
+
+        self._native_check_token_ids(context_ids)
+        attention_mask = torch.ones_like(context_ids)
+        logits_processor = LogitsProcessorList([
+            ValidTokenLogitsProcessor(self.native_quantizer.allowed_token_ids)
+        ])
+        generated = self.gpt2.generate(
+            input_ids=context_ids,
+            attention_mask=attention_mask,
+            logits_processor=logits_processor,
+            min_new_tokens=future_token_count,
+            max_new_tokens=future_token_count,
+            do_sample=False,
+            pad_token_id=getattr(self.gpt2.config, "pad_token_id", None) or getattr(self.gpt2.config, "eos_token_id", 0),
+            eos_token_id=getattr(self.gpt2.config, "eos_token_id", None),
+        )
+        future_ids = generated[:, context_ids.shape[1] :]
+        if future_ids.shape[1] != future_token_count:
+            raise RuntimeError(
+                "Expected {} generated native tokens, got {}.".format(future_token_count, future_ids.shape[1])
+            )
+        self._native_check_token_ids(future_ids)
+        return SimpleNamespace(
+            used_context_ids=context_ids,
+            full_token_ids=generated,
+            future_token_ids=future_ids.reshape(context_ids.shape[0], self.future_patch_count, self.native_token_k),
+        )
+
+    @torch.no_grad()
+    def native_forecast(self, batch_x):
+        history_patches = self._patchify_batch(batch_x)
+        quantized = self._native_quantize_patches(history_patches)
+        context_ids = self._native_flatten_token_ids(quantized.token_ids)
+        generated = self._generate_native_future_tokens(context_ids)
+        future_ids = generated.future_token_ids
+        codebook = self._native_vocab_weight(device=batch_x.device, dtype=batch_x.dtype, detach=True)
+        future_embeds = codebook.index_select(dim=0, index=future_ids.reshape(-1))
+        future_embeds = future_embeds.reshape(
+            batch_x.shape[0],
+            self.future_patch_count,
+            self.native_token_k,
+            self.gpt_dim,
+        )
+        future_patches = self.native_patch_decoder(future_embeds)
+        pred = self._concat_patches(future_patches, history_anchor=batch_x[:, -1:, :])
+        pred = pred[:, : self.pred_len, :]
+        aux = SimpleNamespace(
+            history_token_ids=quantized.token_ids,
+            future_token_ids=future_ids,
+            future_patches=future_patches,
+            allowed_token_ids=self.native_quantizer.allowed_token_ids,
+        )
+        return pred, aux
+
+    @torch.no_grad()
     def _generate_future_tokens(self, history_token_ids):
         max_positions = int(getattr(self.gpt2.config, "n_positions", history_token_ids.shape[1] + self.generated_patch_count))
         max_history = max_positions - self.generated_patch_count
@@ -510,6 +867,8 @@ class GPT2TS(nn.Module):
 
     @torch.no_grad()
     def forecast(self, batch_x):
+        if self.use_native_gpt_vocab:
+            return self.native_forecast(batch_x)
         if not self.dictionary.ready:
             raise RuntimeError("Call fit_patch_token_map with the full training set before forecasting.")
 
@@ -538,6 +897,9 @@ class GPT2TS(nn.Module):
 
     @torch.no_grad()
     def eval_token_ce(self, batch_x, target):
+        if self.use_native_gpt_vocab:
+            losses = self.native_training_loss(batch_x, target, force_gpt=True)
+            return float(losses.loss_ce.detach().cpu().item())
         if not self.dictionary.ready:
             return float("nan")
         target = target[:, -self.pred_len :, :]
@@ -553,6 +915,20 @@ class GPT2TS(nn.Module):
         return float(self._token_ce_from_logits(outputs.logits, labels).detach().cpu().item())
 
     def debug_token_map(self, max_items=8):
+        if self.use_native_gpt_vocab:
+            allowed_token_ids = self.native_quantizer.allowed_token_ids.detach().cpu()
+            lines = [
+                f"native_candidate_token_ids: {int(allowed_token_ids.numel())}",
+                f"native_token_k: {int(self.native_token_k)}",
+                f"original_vocab_size: {int(self.original_vocab_size)}",
+                f"train_stage: {self.train_stage}",
+            ]
+            for token_id in allowed_token_ids[: int(max_items)].tolist():
+                text = ""
+                if self.tokenizer is not None:
+                    text = self.tokenizer.decode([int(token_id)], clean_up_tokenization_spaces=False)
+                lines.append(f"candidate token {int(token_id)} -> {text!r}")
+            return lines
         if not self.dictionary.ready:
             return ["Patch-token map is not fitted."]
         lines = [

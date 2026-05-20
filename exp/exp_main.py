@@ -148,6 +148,9 @@ class Exp_Main(Exp_Basic):
         return sorted(pairs, key=lambda item: (-item[1], item[0]))
 
     def _write_train_token_log(self, save_dir):
+        if getattr(self.model, "use_native_gpt_vocab", False):
+            self._write_native_train_token_log(save_dir)
+            return
         if not hasattr(self.model, "dictionary") or not self.model.dictionary.ready:
             return
 
@@ -183,6 +186,27 @@ class Exp_Main(Exp_Basic):
                 file.write(f"generated_patch_count: {int(self.model.generated_patch_count)}\n")
             file.write(f"cluster_num: {int(dictionary.cluster_num)}\n")
             file.write(f"rematch_interval: {int(getattr(self.args, 'rematch_interval', 0) or 0)}\n")
+
+    def _write_native_train_token_log(self, save_dir):
+        if not getattr(self.model, "use_native_gpt_vocab", False):
+            return
+
+        allowed_token_ids = self.model.native_quantizer.allowed_token_ids.detach().cpu().long()
+        with open(self._token_log_path(save_dir), "w", encoding="utf-8") as file:
+            file.write("[TRAIN]\n")
+            file.write("patch_tokenizer: native_gpt_vocab\n")
+            file.write(f"train_stage: {self.model.train_stage}\n")
+            file.write(f"native_token_k: {int(self.model.native_token_k)}\n")
+            file.write(f"original_vocab_size: {int(self.model.original_vocab_size)}\n")
+            file.write(f"candidate_token_mode: {getattr(self.args, 'candidate_token_mode', 'all')}\n")
+            file.write(f"candidate_token_count: {int(allowed_token_ids.numel())}\n")
+            file.write(f"candidate_token_min: {int(allowed_token_ids.min().item())}\n")
+            file.write(f"candidate_token_max: {int(allowed_token_ids.max().item())}\n")
+            file.write(f"patch_len: {int(self.model.patch_len)}\n")
+            file.write(f"stride: {int(self.model.stride)}\n")
+            file.write(f"history_patch_count: {int(self.model.history_patch_count)}\n")
+            file.write(f"future_patch_count: {int(self.model.future_patch_count)}\n")
+            file.write(f"freeze_gpt_codebook: {bool(getattr(self.args, 'freeze_gpt_codebook', True))}\n")
 
     def _write_test_token_log(self, save_dir, future_token_ids):
         if not future_token_ids:
@@ -385,14 +409,166 @@ class Exp_Main(Exp_Basic):
             self._load_model_checkpoint(checkpoint_path)
         return True
 
+    def _train_native_gpt_vocab(self, train_loader, vali_loader, test_loader, checkpoint_dir, save_dir):
+        checkpoint_path = os.path.join(checkpoint_dir, "checkpoint.pth")
+        self.model._configure_native_train_stage()
+
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        if not trainable_params:
+            print("\tSkipping native GPT vocab training: no trainable parameters.")
+            self._save_model_checkpoint(checkpoint_path)
+            return False
+        if int(self.args.train_epochs) <= 0:
+            print("\tSkipping native GPT vocab training: train_epochs <= 0.")
+            self._save_model_checkpoint(checkpoint_path)
+            return False
+
+        model_optim = optim.Adam(trainable_params, lr=self.args.learning_rate, weight_decay=self.args.weight_decay)
+        scaler = torch.amp.GradScaler(enabled=self.amp_enabled)
+        best_vali_mse = float("inf")
+        patience_counter = 0
+
+        print(
+            "\tNative GPT vocab training | stage: {0} | K: {1} | history patches: {2} | future patches: {3}".format(
+                self.model.train_stage,
+                int(self.model.native_token_k),
+                int(self.model.history_patch_count),
+                int(self.model.future_patch_count),
+            )
+        )
+
+        for epoch in range(self.args.train_epochs):
+            loss_sums = {
+                "total_loss": 0.0,
+                "ce_loss": 0.0,
+                "recon_loss": 0.0,
+                "forecast_loss": 0.0,
+                "commitment_loss": 0.0,
+                "usage_loss": 0.0,
+            }
+            sample_count = 0
+            self.model.train()
+            epoch_time = time.time()
+
+            for batch in train_loader:
+                batch_x = batch[0].to(dtype=torch.float, device=self.device)
+                target = batch[1].to(dtype=torch.float, device=self.device)
+
+                model_optim.zero_grad(set_to_none=True)
+                if self.amp_enabled:
+                    with torch.amp.autocast(device_type=self.device.type, enabled=self.amp_enabled):
+                        losses = self.model.native_training_loss(batch_x, target)
+                    scaler.scale(losses.total_loss).backward()
+                    scaler.step(model_optim)
+                    scaler.update()
+                else:
+                    losses = self.model.native_training_loss(batch_x, target)
+                    losses.total_loss.backward()
+                    model_optim.step()
+
+                batch_size = int(batch_x.shape[0])
+                sample_count += batch_size
+                loss_sums["total_loss"] += float(losses.total_loss.detach().cpu().item()) * batch_size
+                loss_sums["ce_loss"] += float(losses.loss_ce.detach().cpu().item()) * batch_size
+                loss_sums["recon_loss"] += float(losses.loss_recon.detach().cpu().item()) * batch_size
+                loss_sums["forecast_loss"] += float(losses.loss_forecast.detach().cpu().item()) * batch_size
+                loss_sums["commitment_loss"] += float(losses.commitment_loss.detach().cpu().item()) * batch_size
+                loss_sums["usage_loss"] += float(losses.usage_loss.detach().cpu().item()) * batch_size
+
+            train_metrics = {
+                key: value / max(sample_count, 1)
+                for key, value in loss_sums.items()
+            }
+            vali_metrics = self._evaluate_loader(vali_loader)
+            test_metrics = self._evaluate_loader(test_loader)
+
+            if test_metrics["mse"] < self.min_test_loss:
+                self.min_test_loss = test_metrics["mse"]
+                self.min_test_mae = test_metrics["mae"]
+                self.epoch_for_min_test_loss = epoch
+
+            print("Native Epoch {}: cost time: {:.2f} sec".format(epoch + 1, time.time() - epoch_time))
+            print(
+                "\tEpoch {0}: Steps- {1} | Total: {2:.5f} CE: {3:.5f} Recon: {4:.5f} Forecast: {5:.5f} Commit: {6:.5f} Usage: {7:.5f}".format(
+                    epoch + 1,
+                    len(train_loader),
+                    train_metrics["total_loss"],
+                    train_metrics["ce_loss"],
+                    train_metrics["recon_loss"],
+                    train_metrics["forecast_loss"],
+                    train_metrics["commitment_loss"],
+                    train_metrics["usage_loss"],
+                )
+            )
+            print(
+                "\tVali.CE: {0:.5f} Vali.MSE: {1:.5f} Vali.MAE: {2:.5f} Test.MSE: {3:.5f} Test.MAE: {4:.5f} Best.Vali.MSE: {5:.5f}".format(
+                    vali_metrics["token_ce"],
+                    vali_metrics["mse"],
+                    vali_metrics["mae"],
+                    test_metrics["mse"],
+                    test_metrics["mae"],
+                    min(best_vali_mse, vali_metrics["mse"]),
+                )
+            )
+
+            if vali_metrics["mse"] < best_vali_mse:
+                print(f"\tVali.MSE decreased ({best_vali_mse:.6f} --> {vali_metrics['mse']:.6f}).  Saving model ...")
+                best_vali_mse = vali_metrics["mse"]
+                patience_counter = 0
+                self._save_model_checkpoint(checkpoint_path)
+            else:
+                patience_counter += 1
+                print(f"\tEarlyStopping counter: {patience_counter} out of {self.args.patience}")
+                if patience_counter >= self.args.patience:
+                    print("\tEarly stopping")
+                    break
+            if np.isnan(train_metrics["total_loss"]):
+                print("\tStopping: total-loss-nan")
+                break
+
+            adjust_learning_rate(model_optim, None, epoch + 1, self.args)
+
+        if os.path.exists(checkpoint_path):
+            self._load_model_checkpoint(checkpoint_path)
+        self._write_train_token_log(save_dir)
+        return True
+
     # Run training and early stopping.
     def train(self, setting):
-        train_data, _ = self._get_data(flag="train")
+        train_data, train_loader = self._get_data(flag="train")
         _, vali_loader = self._get_data(flag="val")
         _, test_loader = self._get_data(flag="test")
 
         checkpoint_dir = os.path.join(self.results_dir, setting, self.timestamp, "checkpoints")
         os.makedirs(checkpoint_dir, exist_ok=True)
+
+        save_dir = os.path.join(self.results_dir, setting, self.timestamp)
+        os.makedirs(save_dir, exist_ok=True)
+
+        if getattr(self.model, "use_native_gpt_vocab", False):
+            fit_start = time.time()
+            self._write_train_token_log(save_dir)
+            if getattr(self.args, "debug_token_map", False) and hasattr(self.model, "debug_token_map"):
+                for line in self.model.debug_token_map():
+                    print(f"\t{line}")
+            self._train_native_gpt_vocab(train_loader, vali_loader, test_loader, checkpoint_dir, save_dir)
+            vali_loss, vali_mae = self.vali(vali_loader)
+            test_loss, test_mae = self.vali(test_loader)
+            if test_loss < self.min_test_loss:
+                self.min_test_loss = test_loss
+                self.min_test_mae = test_mae
+                if self.epoch_for_min_test_loss < 0:
+                    self.epoch_for_min_test_loss = 0
+            print("Native GPT vocab tokenizer stage finished in {:.2f} sec".format(time.time() - fit_start))
+            print(
+                "\tNative GPT vocab | Vali.MSE: {0:.5f} Vali.MAE: {1:.5f} Test.MSE: {2:.5f} Test.MAE: {3:.5f}".format(
+                    vali_loss,
+                    vali_mae,
+                    test_loss,
+                    test_mae,
+                )
+            )
+            return self.model
 
         if hasattr(self.model, "fit_patch_token_map"):
             if not hasattr(train_data, "data_x"):
@@ -402,8 +578,6 @@ class Exp_Main(Exp_Basic):
             self.model.eval()
             self.model.fit_patch_token_map(train_data.data_x)
 
-            save_dir = os.path.join(self.results_dir, setting, self.timestamp)
-            os.makedirs(save_dir, exist_ok=True)
             self.model.save_patch_token_map(os.path.join(save_dir, "patch_token_map.npz"))
             self._write_train_token_log(save_dir)
             if getattr(self.args, "debug_token_map", False) and hasattr(self.model, "debug_token_map"):
